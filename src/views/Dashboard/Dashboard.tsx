@@ -19,8 +19,10 @@ interface DashboardProps {
 }
 
 export default function Dashboard({ setAuth }: DashboardProps) {
-  // Local development API endpoint context bound to Wrangler local simulator
-  const API_URL = 'http://localhost:8787/api/transactions';
+  // Dynamic API routing boundary: automatically falls back to local simulator if running in dev mode
+  const API_URL = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1'
+    ? 'http://localhost:8787/api/transactions'
+    : 'https://inktrack-api.lapgonzalez96.workers.dev/api/transactions';
 
   // 💾 CORE LEDGER STATE LAYER
   const [transactions, setTransactions] = useState<Transaction[]>([]);

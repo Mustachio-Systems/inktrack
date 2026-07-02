@@ -1,0 +1,9 @@
+#:schema node_modules/wrangler/config-schema.json
+name = "inktrack-api"
+main = "src/worker.ts"
+compatibility_date = "2026-07-02"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "inktrack-db"
+database_id = "28423b6f-b144-40bf-950e-1e1b272d34de"

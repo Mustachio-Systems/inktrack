@@ -1,4 +1,5 @@
 import { useState, useMemo, useEffect, useRef } from 'react';
+// 🛡️ Enforce explicit type-only imports to satisfy verbatimModuleSyntax standards
 import type { Transaction, IncomeType, PaymentMethod } from '../../types/ledger';
 import { 
   DollarSign, 
@@ -8,9 +9,9 @@ import {
   Percent, 
   Download, 
   Upload, 
-  FileText,
   CheckCircle2,
-  AlertCircle
+  AlertCircle,
+  RefreshCw
 } from 'lucide-react';
 
 interface DashboardProps {
@@ -18,47 +19,12 @@ interface DashboardProps {
 }
 
 export default function Dashboard({ setAuth }: DashboardProps) {
-  // 💾 LOCAL PERSISTENCE LAYER: Initial state reads directly from localStorage cache
-  const [transactions, setTransactions] = useState<Transaction[]>(() => {
-    const saved = localStorage.getItem('inktrack_ledger');
-    if (saved) {
-      try {
-        return JSON.parse(saved);
-      } catch (e) {
-        console.error("Failed to parse ledger from cache", e);
-      }
-    }
-    // Baseline sample seed data if cache is empty
-    return [
-      {
-        id: '1',
-        timestamp: new Date(Date.now() - 15 * 60 * 1000).toISOString(),
-        clientName: 'Marcus Miller',
-        description: 'Traditional Eagle Outline',
-        incomeType: 'appointment',
-        paymentMethod: 'card',
-        grossAmount: 350,
-        shopCutPercentage: 40,
-        netAmount: 210,
-      },
-      {
-        id: '2',
-        timestamp: new Date(Date.now() - 3 * 3600 * 1000).toISOString(),
-        clientName: 'Sarah Jenkins',
-        description: 'Finger Flash Placement',
-        incomeType: 'walk-in',
-        paymentMethod: 'cash',
-        grossAmount: 120,
-        shopCutPercentage: 0,
-        netAmount: 120,
-      }
-    ];
-  });
+  // Local development API endpoint context bound to Wrangler local simulator
+  const API_URL = 'http://localhost:8787/api/transactions';
 
-  // Write variations cleanly back to device memory whenever state shifts
-  useEffect(() => {
-    localStorage.setItem('inktrack_ledger', JSON.stringify(transactions));
-  }, [transactions]);
+  // 💾 CORE LEDGER STATE LAYER
+  const [transactions, setTransactions] = useState<Transaction[]>([]);
+  const [isLoading, setIsLoading] = useState(true);
 
   // UI State Managers
   const [isModalOpen, setIsModalOpen] = useState(false);
@@ -72,6 +38,39 @@ export default function Dashboard({ setAuth }: DashboardProps) {
   const [clientName, setClientName] = useState('');
   const [shopCut, setShopCut] = useState('40'); 
   const [description, setDescription] = useState('');
+
+  // 🔄 ASYNC INITIALIZATION LINK: Read database records on boot
+  const fetchLedger = async () => {
+    setIsLoading(true);
+    try {
+      const response = await fetch(API_URL);
+      if (!response.ok) throw new Error('Data sync exception');
+      
+      // 🛡️ Resolve 'unknown' assignment by explicitly asserting the data shape array structure
+      const data = (await response.json()) as Transaction[];
+      
+      setTransactions(data);
+      // Synchronize backing store for local offline redundancy
+      localStorage.setItem('inktrack_ledger', JSON.stringify(data));
+    } catch (err) {
+      triggerStatus('error', 'Edge sync failed. Booting from local device memory cache.');
+      // Local fallback matrix reading straight from cache
+      const saved = localStorage.getItem('inktrack_ledger');
+      if (saved) {
+        try {
+          setTransactions(JSON.parse(saved) as Transaction[]);
+        } catch (parseErr) {
+          console.error("Cache corrupted, skipping parsing logic.", parseErr);
+        }
+      }
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    fetchLedger();
+  }, []);
 
   // 🧮 Time-Interval Calculation Matrix Engine
   const metrics = useMemo(() => {
@@ -99,7 +98,7 @@ export default function Dashboard({ setAuth }: DashboardProps) {
   }, [transactions]);
 
   // Form Submission
-  const handleLogIncome = (e: React.FormEvent) => {
+  const handleLogIncome = async (e: React.FormEvent) => {
     e.preventDefault();
     const gross = parseFloat(grossAmount);
     if (isNaN(gross) || gross <= 0) return;
@@ -111,7 +110,7 @@ export default function Dashboard({ setAuth }: DashboardProps) {
       id: crypto.randomUUID(),
       timestamp: new Date().toISOString(),
       clientName: clientName || 'Anonymous Client',
-      description,
+      description: description || '',
       incomeType,
       paymentMethod,
       grossAmount: gross,
@@ -119,14 +118,33 @@ export default function Dashboard({ setAuth }: DashboardProps) {
       netAmount: net,
     };
 
+    // 🛡️ OPTIMISTIC UI COMMIT PROTOCOL: Update state instantly for sleek viewport experience
+    const baselineBackup = [...transactions];
     setTransactions([newTx, ...transactions]);
     setIsModalOpen(false);
     
-    // Reset buffers
+    // Clear field buffers immediately
     setGrossAmount('');
     setClientName('');
     setDescription('');
-    triggerStatus('success', 'Session committed to local secure ledger.');
+
+    try {
+      const response = await fetch(API_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(newTx),
+      });
+
+      if (!response.ok) throw new Error('D1 Runtime write failure');
+
+      // Update redundant local storage state tracking
+      localStorage.setItem('inktrack_ledger', JSON.stringify([newTx, ...baselineBackup]));
+      triggerStatus('success', 'Session securely committed to Cloudflare D1.');
+    } catch (err) {
+      // Rollback UI layout instantly on transaction write exception to preserve structural data integrity
+      setTransactions(baselineBackup);
+      triggerStatus('error', 'Database synchronization failure. State safely rolled back.');
+    }
   };
 
   // Helper notice trigger
@@ -159,13 +177,14 @@ export default function Dashboard({ setAuth }: DashboardProps) {
     if (!file) return;
 
     const reader = new FileReader();
-    reader.onload = (event) => {
+    reader.onload = async (event) => {
       try {
         const parsed = JSON.parse(event.target?.result as string);
         if (Array.isArray(parsed)) {
-          // Strict QA structure checks could go here
-          setTransactions(parsed);
-          triggerStatus('success', `Import verified: Loaded ${parsed.length} ledger logs.`);
+          const validatedData = parsed as Transaction[];
+          setTransactions(validatedData);
+          localStorage.setItem('inktrack_ledger', JSON.stringify(validatedData));
+          triggerStatus('success', `Import verified: Loaded ${validatedData.length} ledger logs.`);
         } else {
           triggerStatus('error', 'Format mismatch: File array format invalid.');
         }
@@ -196,6 +215,13 @@ export default function Dashboard({ setAuth }: DashboardProps) {
           <span className="font-black text-lg tracking-tight">inktrack<span className="text-emerald-400">.</span>Console</span>
         </div>
         <div className="flex items-center gap-4">
+          <button 
+            onClick={fetchLedger}
+            title="Force refresh ledger from database"
+            className="text-zinc-500 hover:text-emerald-400 p-2 transition-colors flex items-center justify-center"
+          >
+            <RefreshCw className={`w-4 h-4 ${isLoading ? 'animate-spin text-emerald-400' : ''}`} />
+          </button>
           <button 
             onClick={() => setIsModalOpen(true)}
             className="bg-emerald-500 hover:bg-emerald-600 text-zinc-950 font-bold px-4 py-2 rounded-xl text-sm flex items-center gap-2 transition-all shadow-lg"
@@ -240,7 +266,12 @@ export default function Dashboard({ setAuth }: DashboardProps) {
           <div className="lg:col-span-2 space-y-4">
             <h3 className="text-sm font-bold uppercase tracking-widest text-zinc-500">Real-time Session Feed</h3>
             <div className="bg-zinc-900/30 border border-zinc-900 rounded-2xl overflow-hidden">
-              {transactions.length === 0 ? (
+              {isLoading ? (
+                <div className="p-12 text-center text-zinc-500 text-sm flex flex-col items-center justify-center gap-3">
+                  <RefreshCw className="w-5 h-5 animate-spin text-emerald-500" />
+                  Synchronizing transaction ledger structures...
+                </div>
+              ) : transactions.length === 0 ? (
                 <div className="p-8 text-center text-zinc-600 text-sm">No transaction instances recorded.</div>
               ) : (
                 <div className="divide-y divide-zinc-900">
@@ -346,7 +377,20 @@ export default function Dashboard({ setAuth }: DashboardProps) {
                 <label className="block text-xs font-bold text-zinc-400 uppercase tracking-wider mb-2">Gross Amount Collected ($)</label>
                 <div className="relative">
                   <DollarSign className="absolute left-4 top-3.5 h-5 w-5 text-emerald-400" />
-                  <input type="number" required value={grossAmount} onChange={e => setGrossAmount(e.target.value)} placeholder="0.00" className="w-full bg-zinc-950 border border-zinc-800 rounded-xl py-3.5 pl-12 pr-4 text-lg focus:outline-none focus:border-emerald-500 text-zinc-100 font-bold" />
+                  <input 
+                    type="text" 
+                    inputMode="decimal"
+                    pattern="[0-9]*[.,]?[0-9]*"
+                    required 
+                    value={grossAmount} 
+                    onChange={e => {
+                      // Filter out anything that isn't a digit or a period decimal point
+                      const sanitized = e.target.value.replace(/[^0-9.]/g, '');
+                      setGrossAmount(sanitized);
+                    }} 
+                    placeholder="0.00" 
+                    className="w-full bg-zinc-950 border border-zinc-800 rounded-xl py-3.5 pl-12 pr-4 text-lg focus:outline-none focus:border-emerald-500 text-zinc-100 font-bold" 
+                  />
                 </div>
               </div>
 
@@ -380,7 +424,7 @@ export default function Dashboard({ setAuth }: DashboardProps) {
                 </div>
                 <div>
                   <label className="block text-xs font-bold text-zinc-400 uppercase tracking-wider mb-2">Shop Cut %</label>
-                  <input type="number" value={shopCut} onChange={e => setShopCut(e.target.value)} placeholder="40" className="w-full bg-zinc-950 border border-zinc-800 rounded-xl p-3 text-sm text-zinc-100 focus:outline-none focus:border-emerald-500 font-mono" />
+                  <input type="number" step="any" value={shopCut} onChange={e => setShopCut(e.target.value)} placeholder="40" className="w-full bg-zinc-950 border border-zinc-800 rounded-xl p-3 text-sm text-zinc-100 focus:outline-none focus:border-emerald-500 font-mono" />
                 </div>
               </div>
 

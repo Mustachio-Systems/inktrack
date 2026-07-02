@@ -59,27 +59,73 @@ export default function Auth({ setAuth, mode: initialMode }: AuthProps) {
     if (!validateForm()) return;
     setIsLoading(true);
 
+    // 🌐 Dynamic Environment API Routing Matrix
+    const BASE_API = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1'
+      ? 'http://localhost:8787'
+      : 'https://inktrack-api.lapgonzalez96.workers.dev';
+
     try {
+      // ---------------------------------------------------------
+      // 🔓 SUBMIT ROUTE 1: AUTHENTICATE / SIGN IN
+      // ---------------------------------------------------------
       if (viewMode === 'login') {
-        // TODO: Replace mock with actual network execution:
-        // await supabase.auth.signInWithPassword({ email, password })
-        console.log('Executing login token transaction pipeline...');
+        const response = await fetch(`${BASE_API}/api/auth/login`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ email, password }),
+        });
+
+        const data = await response.json() as any;
+
+        if (!response.ok) {
+          throw new Error(data.error || 'Identity credentials validation failed.');
+        }
+
+        // 🛡️ QA DATA BOUNDARY POLICY: Lock down the session JWT token string safely
+        localStorage.setItem('inktrack_token', data.token);
         
         setAuth(true);
         navigate('/dashboard');
-      } else if (viewMode === 'signup') {
-        // TODO: Replace mock with actual network execution:
-        // await supabase.auth.signUp({ email, password, options: { data: { artist_name: artistName } } })
-        console.log('Registering secure profile configuration records...');
-        
-        setSuccessMessage('Profile initiated securely. Check your email to verify your endpoint credentials.');
+      } 
+      
+      // ---------------------------------------------------------
+      // 📝 SUBMIT ROUTE 2: PROVISION PROFILE / SIGN UP
+      // ---------------------------------------------------------
+      else if (viewMode === 'signup') {
+        const response = await fetch(`${BASE_API}/api/auth/signup`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ email, password, artistName }),
+        });
+
+        const data = await response.json() as any;
+
+        if (!response.ok) {
+          throw new Error(data.error || 'Profile initiation encountered a structural issue.');
+        }
+
+        setSuccessMessage('Profile initiated securely! Authenticate your token to access the studio dashboard.');
         setViewMode('login');
-      } else if (viewMode === 'forgot') {
-        // TODO: Replace mock with actual network execution:
-        // await supabase.auth.resetPasswordForEmail(email, { redirectTo: window.location.origin + '/reset-password' })
-        console.log('Dispatching cryptographic recovery link payload to destination address...');
-        
-        setSuccessMessage('If this configuration profile exists, a recovery validation link has been sent.');
+        setPassword(''); // Clear security fields
+      } 
+      
+      // ---------------------------------------------------------
+      // 🔑 SUBMIT ROUTE 3: INITIALIZE PASSWORD RESET LOOP
+      // ---------------------------------------------------------
+      else if (viewMode === 'forgot') {
+        const response = await fetch(`${BASE_API}/api/auth/forgot`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ email }),
+        });
+
+        const data = await response.json() as any;
+
+        if (!response.ok) {
+          throw new Error(data.error || 'Verification network transmission error.');
+        }
+
+        setSuccessMessage('If this configuration profile exists, an authorized verification sequence has initialized.');
       }
     } catch (err: any) {
       setError(err?.message || 'A network communication timeout occurred inside the authorization engine.');
@@ -116,7 +162,7 @@ export default function Auth({ setAuth, mode: initialMode }: AuthProps) {
             </h2>
             {viewMode === 'forgot' && (
               <button 
-                onClick={() => { setViewMode('login'); setError(null); }}
+                onClick={() => { setViewMode('login'); setError(null); setSuccessMessage(null); }}
                 className="text-zinc-500 hover:text-zinc-300 text-xs font-bold flex items-center gap-1 transition-colors"
               >
                 <ArrowLeft className="w-3 h-3" /> Back
@@ -222,13 +268,13 @@ export default function Auth({ setAuth, mode: initialMode }: AuthProps) {
           {/* Context Switching Footers */}
           <div className="border-t border-zinc-800/80 mt-6 pt-6 text-center text-xs text-zinc-500">
             {viewMode === 'login' && (
-              <span>New to the suite? <button onClick={() => { setViewMode('signup'); setError(null); }} className="text-emerald-400 font-semibold hover:underline bg-transparent border-none cursor-pointer">Provision account</button></span>
+              <span>New to the suite? <button onClick={() => { setViewMode('signup'); setError(null); setSuccessMessage(null); }} className="text-emerald-400 font-semibold hover:underline bg-transparent border-none cursor-pointer">Provision account</button></span>
             )}
             {viewMode === 'signup' && (
-              <span>Already registered? <button onClick={() => { setViewMode('login'); setError(null); }} className="text-emerald-400 font-semibold hover:underline bg-transparent border-none cursor-pointer">Return to validation</button></span>
+              <span>Already registered? <button onClick={() => { setViewMode('login'); setError(null); setSuccessMessage(null); }} className="text-emerald-400 font-semibold hover:underline bg-transparent border-none cursor-pointer">Return to validation</button></span>
             )}
             {viewMode === 'forgot' && (
-              <span>Remembered details? <button onClick={() => { setViewMode('login'); setError(null); }} className="text-emerald-400 font-semibold hover:underline bg-transparent border-none cursor-pointer">Log in here</button></span>
+              <span>Remembered details? <button onClick={() => { setViewMode('login'); setError(null); setSuccessMessage(null); }} className="text-emerald-400 font-semibold hover:underline bg-transparent border-none cursor-pointer">Log in here</button></span>
             )}
           </div>
         </div>

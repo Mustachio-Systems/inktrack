@@ -1,4 +1,5 @@
 #:schema node_modules/wrangler/config-schema.json
+
 name = "inktrack-api"
 main = "src/worker.ts"
 compatibility_date = "2026-07-02"
@@ -7,3 +8,13 @@ compatibility_date = "2026-07-02"
 binding = "DB"
 database_name = "inktrack-db"
 database_id = "28423b6f-b144-40bf-950e-1e1b272d34de"
+
+[vars]
+# Replace this with a sender address using a domain verified in Resend.
+# Example after verifying notify.yourdomain.com:
+# EMAIL_FROM = "InkTrack <support@notify.yourdomain.com>"
+EMAIL_FROM = "InkTrack <onboarding@resend.dev>"
+
+# Your deployed Cloudflare Pages site. The reset link becomes:
+# https://inktrack.pages.dev/reset-password?token=...
+APP_URL = "https://inktrack.pages.dev"

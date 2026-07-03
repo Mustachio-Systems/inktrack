@@ -3,118 +3,22 @@
 export interface Env {
   DB: D1Database;
   JWT_SECRET: string;
-  // Optional — set to "development" in wrangler.toml [vars] for local/dev
-  // environments only. Anything else (including unset) is treated as
-  // production and will NOT log reset tokens to the console.
+
+  // Cloudflare Worker secrets / variables
+  RESEND_API_KEY: string;
+  EMAIL_FROM: string;
+  APP_URL: string;
+
   ENVIRONMENT?: string;
 }
 
-// ---------------------------------------------------------------------------
-// 🛡️ NATIVE WEB CRYPTO UTILITIES
-// ---------------------------------------------------------------------------
-const CryptoUtils = {
-  uuidv4(): string {
-    return crypto.randomUUID();
-  },
+type JsonRecord = Record<string, unknown>;
 
-  // 32 random bytes -> 64 hex chars. Used for password reset tokens instead
-  // of a UUID, since it carries meaningfully more entropy for a bearer token
-  // that grants a password change.
-  generateResetToken(): string {
-    const bytes = crypto.getRandomValues(new Uint8Array(32));
-    return Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
-  },
-
-  async hashPassword(password: string): Promise<string> {
-    const salt = crypto.getRandomValues(new Uint8Array(16));
-    const baseKey = await crypto.subtle.importKey(
-      "raw", new TextEncoder().encode(password), "PBKDF2", false, ["deriveBits"]
-    );
-    const bits = await crypto.subtle.deriveBits(
-      { name: "PBKDF2", salt, iterations: 100000, hash: "SHA-256" }, baseKey, 256
-    );
-    const saltHex = Array.from(salt).map(b => b.toString(16).padStart(2, '0')).join('');
-    const hashHex = Array.from(new Uint8Array(bits)).map(b => b.toString(16).padStart(2, '0')).join('');
-    return `${saltHex}:${hashHex}`;
-  },
-
-  // Constant-time string comparison. Prevents an attacker from using
-  // response-time differences to guess a hash byte-by-byte. Both inputs are
-  // hex-encoded hashes so length-branching on unequal length is safe (an
-  // attacker learns nothing new — hash length is fixed and public).
-  timingSafeEqual(a: string, b: string): boolean {
-    if (a.length !== b.length) return false;
-    let result = 0;
-    for (let i = 0; i < a.length; i++) {
-      result |= a.charCodeAt(i) ^ b.charCodeAt(i);
-    }
-    return result === 0;
-  },
-
-  async verifyPassword(password: string, storedHash: string): Promise<boolean> {
-    const [saltHex, originalHashHex] = storedHash.split(':');
-    if (!saltHex || !originalHashHex) return false;
-    const salt = new Uint8Array(saltHex.match(/.{1,2}/g)!.map(b => parseInt(b, 16)));
-    const baseKey = await crypto.subtle.importKey(
-      "raw", new TextEncoder().encode(password), "PBKDF2", false, ["deriveBits"]
-    );
-    const bits = await crypto.subtle.deriveBits(
-      { name: "PBKDF2", salt, iterations: 100000, hash: "SHA-256" }, baseKey, 256
-    );
-    const candidateHashHex = Array.from(new Uint8Array(bits)).map(b => b.toString(16).padStart(2, '0')).join('');
-    return CryptoUtils.timingSafeEqual(candidateHashHex, originalHashHex);
-  },
-
-  async generateToken(payload: { artistId: string }, secret: string): Promise<string> {
-    const header = btoa(JSON.stringify({ alg: "HS256", typ: "JWT" }));
-    const encPayload = btoa(JSON.stringify({ ...payload, exp: Math.floor(Date.now() / 1000) + (60 * 60 * 24) }));
-    const key = await crypto.subtle.importKey(
-      "raw", new TextEncoder().encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]
-    );
-    const signature = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(`${header}.${encPayload}`));
-    const sigHex = Array.from(new Uint8Array(signature)).map(b => b.toString(16).padStart(2, '0')).join('');
-    return `${header}.${encPayload}.${sigHex}`;
-  },
-
-  async verifyToken(token: string, secret: string): Promise<{ artistId: string } | null> {
-    try {
-      const [header, encPayload, sigHex] = token.split('.');
-      const key = await crypto.subtle.importKey(
-        "raw", new TextEncoder().encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["verify"]
-      );
-      const verified = await crypto.subtle.verify(
-        "HMAC", key, new Uint8Array(sigHex.match(/.{1,2}/g)!.map(b => parseInt(b, 16))), new TextEncoder().encode(`${header}.${encPayload}`)
-      );
-      if (!verified) return null;
-      const payload = JSON.parse(atob(encPayload));
-      if (Math.floor(Date.now() / 1000) > payload.exp) return null;
-      return { artistId: payload.artistId };
-    } catch {
-      return null;
-    }
-  }
-};
-
-// ---------------------------------------------------------------------------
-// 🧪 VALIDATION
-// ---------------------------------------------------------------------------
-const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-const INCOME_TYPES = new Set(['appointment', 'walk-in', 'deposit', 'tip']);
-const PAYMENT_METHODS = new Set(['cash', 'card', 'ath-movil', 'zelle', 'venmo', 'paypal']);
-
-function isValidEmail(v: unknown): v is string {
-  return typeof v === 'string' && v.length <= 254 && EMAIL_RE.test(v);
-}
-
-function isNonEmptyString(v: unknown, maxLen = 255): v is string {
-  return typeof v === 'string' && v.trim().length > 0 && v.length <= maxLen;
-}
-
-// 8-128 chars. The upper bound isn't arbitrary hardening — PBKDF2 cost scales
-// with input size, so capping length limits how expensive a single hashing
-// call can be made by a malicious payload.
-function isValidPassword(v: unknown): v is string {
-  return typeof v === 'string' && v.length >= 8 && v.length <= 128;
+interface EmailInput {
+  to: string;
+  subject: string;
+  text: string;
+  html: string;
 }
 
 interface IncomingTransaction {
@@ -128,27 +32,418 @@ interface IncomingTransaction {
   shopCutPercentage: number;
 }
 
-function validateTransactionPayload(data: any): { ok: true; value: IncomingTransaction } | { ok: false; error: string } {
-  if (!data || typeof data !== 'object') return { ok: false, error: 'Missing transaction body.' };
-  if (!isNonEmptyString(data.id, 64)) return { ok: false, error: 'Missing or invalid id.' };
-  if (typeof data.timestamp !== 'string' || isNaN(Date.parse(data.timestamp))) {
+interface ArtistRecord {
+  id: string;
+  email?: string;
+  password_hash?: string;
+  artist_name?: string;
+}
+
+interface PasswordResetRecord {
+  artist_id: string;
+  expires_at: string;
+  used: number | boolean;
+}
+
+// ---------------------------------------------------------------------------
+// CONSTANTS
+// ---------------------------------------------------------------------------
+
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const INCOME_TYPES = new Set(['appointment', 'walk-in', 'deposit', 'tip']);
+const PAYMENT_METHODS = new Set(['cash', 'card', 'ath-movil', 'zelle', 'venmo', 'paypal']);
+
+const RESET_TOKEN_TTL_MS = 60 * 60 * 1000; // 1 hour
+const SESSION_TTL_SECONDS = 60 * 60 * 24; // 24 hours
+
+// ---------------------------------------------------------------------------
+// NATIVE WEB CRYPTO UTILITIES
+// ---------------------------------------------------------------------------
+
+const CryptoUtils = {
+  uuidv4(): string {
+    return crypto.randomUUID();
+  },
+
+  generateResetToken(): string {
+    const bytes = crypto.getRandomValues(new Uint8Array(32));
+    return Array.from(bytes)
+      .map((byte) => byte.toString(16).padStart(2, '0'))
+      .join('');
+  },
+
+  async hashPassword(password: string): Promise<string> {
+    const salt = crypto.getRandomValues(new Uint8Array(16));
+    const baseKey = await crypto.subtle.importKey(
+      'raw',
+      new TextEncoder().encode(password),
+      'PBKDF2',
+      false,
+      ['deriveBits'],
+    );
+
+    const bits = await crypto.subtle.deriveBits(
+      {
+        name: 'PBKDF2',
+        salt,
+        iterations: 100000,
+        hash: 'SHA-256',
+      },
+      baseKey,
+      256,
+    );
+
+    const saltHex = Array.from(salt)
+      .map((byte) => byte.toString(16).padStart(2, '0'))
+      .join('');
+
+    const hashHex = Array.from(new Uint8Array(bits))
+      .map((byte) => byte.toString(16).padStart(2, '0'))
+      .join('');
+
+    return `${saltHex}:${hashHex}`;
+  },
+
+  timingSafeEqual(a: string, b: string): boolean {
+    if (a.length !== b.length) return false;
+
+    let result = 0;
+    for (let index = 0; index < a.length; index += 1) {
+      result |= a.charCodeAt(index) ^ b.charCodeAt(index);
+    }
+
+    return result === 0;
+  },
+
+  async verifyPassword(password: string, storedHash: string): Promise<boolean> {
+    const [saltHex, originalHashHex] = storedHash.split(':');
+
+    if (!saltHex || !originalHashHex || !/^[a-f0-9]+$/i.test(saltHex) || !/^[a-f0-9]+$/i.test(originalHashHex)) {
+      return false;
+    }
+
+    const saltPairs = saltHex.match(/.{1,2}/g);
+    if (!saltPairs) return false;
+
+    const salt = new Uint8Array(saltPairs.map((pair) => parseInt(pair, 16)));
+
+    const baseKey = await crypto.subtle.importKey(
+      'raw',
+      new TextEncoder().encode(password),
+      'PBKDF2',
+      false,
+      ['deriveBits'],
+    );
+
+    const bits = await crypto.subtle.deriveBits(
+      {
+        name: 'PBKDF2',
+        salt,
+        iterations: 100000,
+        hash: 'SHA-256',
+      },
+      baseKey,
+      256,
+    );
+
+    const candidateHashHex = Array.from(new Uint8Array(bits))
+      .map((byte) => byte.toString(16).padStart(2, '0'))
+      .join('');
+
+    return CryptoUtils.timingSafeEqual(candidateHashHex, originalHashHex);
+  },
+
+  async generateToken(payload: { artistId: string }, secret: string): Promise<string> {
+    const header = btoa(JSON.stringify({ alg: 'HS256', typ: 'JWT' }));
+    const encodedPayload = btoa(
+      JSON.stringify({
+        ...payload,
+        exp: Math.floor(Date.now() / 1000) + SESSION_TTL_SECONDS,
+      }),
+    );
+
+    const key = await crypto.subtle.importKey(
+      'raw',
+      new TextEncoder().encode(secret),
+      { name: 'HMAC', hash: 'SHA-256' },
+      false,
+      ['sign'],
+    );
+
+    const signature = await crypto.subtle.sign(
+      'HMAC',
+      key,
+      new TextEncoder().encode(`${header}.${encodedPayload}`),
+    );
+
+    const signatureHex = Array.from(new Uint8Array(signature))
+      .map((byte) => byte.toString(16).padStart(2, '0'))
+      .join('');
+
+    return `${header}.${encodedPayload}.${signatureHex}`;
+  },
+
+  async verifyToken(token: string, secret: string): Promise<{ artistId: string } | null> {
+    try {
+      const [header, encodedPayload, signatureHex] = token.split('.');
+
+      if (!header || !encodedPayload || !signatureHex || !/^[a-f0-9]+$/i.test(signatureHex)) {
+        return null;
+      }
+
+      const signaturePairs = signatureHex.match(/.{1,2}/g);
+      if (!signaturePairs) return null;
+
+      const key = await crypto.subtle.importKey(
+        'raw',
+        new TextEncoder().encode(secret),
+        { name: 'HMAC', hash: 'SHA-256' },
+        false,
+        ['verify'],
+      );
+
+      const verified = await crypto.subtle.verify(
+        'HMAC',
+        key,
+        new Uint8Array(signaturePairs.map((pair) => parseInt(pair, 16))),
+        new TextEncoder().encode(`${header}.${encodedPayload}`),
+      );
+
+      if (!verified) return null;
+
+      const payload = JSON.parse(atob(encodedPayload)) as { artistId?: unknown; exp?: unknown };
+
+      if (
+        typeof payload.artistId !== 'string' ||
+        typeof payload.exp !== 'number' ||
+        Math.floor(Date.now() / 1000) > payload.exp
+      ) {
+        return null;
+      }
+
+      return { artistId: payload.artistId };
+    } catch {
+      return null;
+    }
+  },
+};
+
+// ---------------------------------------------------------------------------
+// VALIDATION + SMALL HELPERS
+// ---------------------------------------------------------------------------
+
+function isValidEmail(value: unknown): value is string {
+  return typeof value === 'string' && value.length <= 254 && EMAIL_RE.test(value);
+}
+
+function isNonEmptyString(value: unknown, maxLength = 255): value is string {
+  return typeof value === 'string' && value.trim().length > 0 && value.length <= maxLength;
+}
+
+function isValidPassword(value: unknown): value is string {
+  return typeof value === 'string' && value.length >= 8 && value.length <= 128;
+}
+
+function escapeHtml(value: string): string {
+  return value.replace(/[&<>"']/g, (character) => {
+    const entities: Record<string, string> = {
+      '&': '&amp;',
+      '<': '&lt;',
+      '>': '&gt;',
+      '"': '&quot;',
+      "'": '&#039;',
+    };
+
+    return entities[character];
+  });
+}
+
+function getResetUrl(appUrl: string, token: string): string {
+  const url = new URL('/reset-password', appUrl);
+  url.searchParams.set('token', token);
+  return url.toString();
+}
+
+function jsonResponse(
+  data: unknown,
+  status = 200,
+  extraHeaders: Record<string, string> = {},
+): Response {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: {
+      'Content-Type': 'application/json; charset=utf-8',
+      ...extraHeaders,
+    },
+  });
+}
+
+function htmlEmailShell(title: string, bodyHtml: string): string {
+  return `
+<!doctype html>
+<html lang="en">
+  <body style="margin:0;padding:0;background:#f4efe7;color:#16130f;font-family:Arial,Helvetica,sans-serif;">
+    <div style="max-width:600px;margin:0 auto;padding:32px 18px;">
+      <div style="background:#16130f;color:#efe7d8;padding:20px 24px;">
+        <div style="font-size:22px;font-weight:700;letter-spacing:.4px;">
+          inktrack<span style="color:#c39a48;">.</span>
+        </div>
+        <div style="font-size:11px;letter-spacing:2px;text-transform:uppercase;color:#c39a48;margin-top:4px;">
+          Artist Revenue Console
+        </div>
+      </div>
+      <div style="background:#ffffff;padding:30px 24px;border:1px solid #e4ddd1;">
+        <h1 style="margin:0 0 16px;font-size:26px;line-height:1.2;color:#16130f;">
+          ${title}
+        </h1>
+        ${bodyHtml}
+      </div>
+      <div style="padding:18px 10px;color:#786f65;font-size:12px;line-height:1.5;">
+        InkTrack helps artists keep a clear ledger of sessions, earnings, and shop splits.
+      </div>
+    </div>
+  </body>
+</html>`;
+}
+
+// ---------------------------------------------------------------------------
+// EMAIL DELIVERY THROUGH RESEND
+// ---------------------------------------------------------------------------
+
+async function sendEmail(env: Env, email: EmailInput): Promise<void> {
+  if (!env.RESEND_API_KEY || !env.EMAIL_FROM || !env.APP_URL) {
+    throw new Error('Email configuration is incomplete.');
+  }
+
+  const response = await fetch('https://api.resend.com/emails', {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${env.RESEND_API_KEY}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      from: env.EMAIL_FROM,
+      to: [email.to],
+      subject: email.subject,
+      text: email.text,
+      html: email.html,
+    }),
+  });
+
+  if (!response.ok) {
+    const resendError = await response.text();
+    console.error('Resend email delivery failed:', response.status, resendError);
+    throw new Error(`Resend rejected email request with status ${response.status}.`);
+  }
+}
+
+async function sendWelcomeEmail(env: Env, email: string, artistName: string): Promise<void> {
+  const safeName = escapeHtml(artistName);
+  const dashboardUrl = new URL('/dashboard', env.APP_URL).toString();
+
+  await sendEmail(env, {
+    to: email,
+    subject: 'Welcome to InkTrack',
+    text: `Welcome to InkTrack, ${artistName}. Your ledger is ready. Open InkTrack: ${dashboardUrl}`,
+    html: htmlEmailShell(
+      `Welcome to InkTrack, ${safeName}.`,
+      `
+        <p style="font-size:16px;line-height:1.6;margin:0 0 16px;">
+          Your artist ledger is ready. You can now log sessions, track weekly income,
+          review shop splits, and see how your month is progressing.
+        </p>
+        <p style="margin:24px 0;">
+          <a href="${dashboardUrl}" style="display:inline-block;background:#a83a2c;color:#ffffff;text-decoration:none;padding:13px 18px;font-weight:700;border-radius:4px;">
+            Open InkTrack
+          </a>
+        </p>
+        <p style="font-size:12px;color:#786f65;line-height:1.5;margin:20px 0 0;">
+          If you did not create this account, you can safely ignore this email.
+        </p>`,
+    ),
+  });
+}
+
+async function sendPasswordResetEmail(env: Env, email: string, resetUrl: string): Promise<void> {
+  await sendEmail(env, {
+    to: email,
+    subject: 'Reset your InkTrack password',
+    text: `We received a request to reset your InkTrack password. Use this link within one hour: ${resetUrl}`,
+    html: htmlEmailShell(
+      'Reset your password',
+      `
+        <p style="font-size:16px;line-height:1.6;margin:0 0 16px;">
+          We received a request to reset the password for your InkTrack account.
+        </p>
+        <p style="margin:24px 0;">
+          <a href="${resetUrl}" style="display:inline-block;background:#a83a2c;color:#ffffff;text-decoration:none;padding:13px 18px;font-weight:700;border-radius:4px;">
+            Reset Password
+          </a>
+        </p>
+        <p style="font-size:14px;line-height:1.6;margin:0;">
+          This reset link expires in <strong>1 hour</strong>.
+        </p>
+        <p style="font-size:12px;color:#786f65;line-height:1.5;margin:20px 0 0;">
+          If you did not request a password reset, you can safely ignore this email.
+        </p>`,
+    ),
+  });
+}
+
+// ---------------------------------------------------------------------------
+// TRANSACTION VALIDATION
+// ---------------------------------------------------------------------------
+
+function validateTransactionPayload(
+  data: unknown,
+): { ok: true; value: IncomingTransaction } | { ok: false; error: string } {
+  if (!data || typeof data !== 'object') {
+    return { ok: false, error: 'Missing transaction body.' };
+  }
+
+  const transaction = data as JsonRecord;
+
+  if (!isNonEmptyString(transaction.id, 64)) {
+    return { ok: false, error: 'Missing or invalid id.' };
+  }
+
+  if (typeof transaction.timestamp !== 'string' || Number.isNaN(Date.parse(transaction.timestamp))) {
     return { ok: false, error: 'Missing or invalid timestamp.' };
   }
-  if (data.clientName !== undefined && data.clientName !== null && typeof data.clientName !== 'string') {
+
+  if (
+    transaction.clientName !== undefined &&
+    transaction.clientName !== null &&
+    typeof transaction.clientName !== 'string'
+  ) {
     return { ok: false, error: 'Invalid clientName.' };
   }
-  if (data.description !== undefined && data.description !== null && typeof data.description !== 'string') {
+
+  if (
+    transaction.description !== undefined &&
+    transaction.description !== null &&
+    typeof transaction.description !== 'string'
+  ) {
     return { ok: false, error: 'Invalid description.' };
   }
-  if (!INCOME_TYPES.has(data.incomeType)) return { ok: false, error: 'Invalid incomeType.' };
-  if (!PAYMENT_METHODS.has(data.paymentMethod)) return { ok: false, error: 'Invalid paymentMethod.' };
 
-  const gross = Number(data.grossAmount);
+  if (typeof transaction.incomeType !== 'string' || !INCOME_TYPES.has(transaction.incomeType)) {
+    return { ok: false, error: 'Invalid incomeType.' };
+  }
+
+  if (
+    typeof transaction.paymentMethod !== 'string' ||
+    !PAYMENT_METHODS.has(transaction.paymentMethod)
+  ) {
+    return { ok: false, error: 'Invalid paymentMethod.' };
+  }
+
+  const gross = Number(transaction.grossAmount);
   if (!Number.isFinite(gross) || gross <= 0 || gross > 1_000_000) {
     return { ok: false, error: 'grossAmount must be a positive number.' };
   }
 
-  const cut = Number(data.shopCutPercentage);
+  const cut = Number(transaction.shopCutPercentage);
   if (!Number.isFinite(cut) || cut < 0 || cut > 100) {
     return { ok: false, error: 'shopCutPercentage must be between 0 and 100.' };
   }
@@ -156,25 +451,41 @@ function validateTransactionPayload(data: any): { ok: true; value: IncomingTrans
   return {
     ok: true,
     value: {
-      id: data.id,
-      timestamp: data.timestamp,
-      clientName: (data.clientName || 'Anonymous Client').slice(0, 255),
-      description: data.description ? String(data.description).slice(0, 1000) : null,
-      incomeType: data.incomeType,
-      paymentMethod: data.paymentMethod,
+      id: transaction.id,
+      timestamp: transaction.timestamp,
+      clientName:
+        typeof transaction.clientName === 'string' && transaction.clientName.trim()
+          ? transaction.clientName.trim().slice(0, 255)
+          : 'Anonymous Client',
+      description:
+        typeof transaction.description === 'string' && transaction.description.trim()
+          ? transaction.description.trim().slice(0, 1000)
+          : null,
+      incomeType: transaction.incomeType,
+      paymentMethod: transaction.paymentMethod,
       grossAmount: Math.round(gross * 100) / 100,
       shopCutPercentage: Math.round(cut * 100) / 100,
     },
   };
 }
 
-async function parseJsonBody(request: Request): Promise<any | null> {
+async function parseJsonBody(request: Request): Promise<JsonRecord | null> {
   try {
-    return await request.json();
+    const body = await request.json();
+
+    if (!body || typeof body !== 'object' || Array.isArray(body)) {
+      return null;
+    }
+
+    return body as JsonRecord;
   } catch {
     return null;
   }
 }
+
+// ---------------------------------------------------------------------------
+// WORKER
+// ---------------------------------------------------------------------------
 
 export default {
   async fetch(request: Request, env: Env, _ctx: ExecutionContext): Promise<Response> {
@@ -190,186 +501,272 @@ export default {
       return new Response(null, { headers: corsHeaders });
     }
 
-    const jsonResponse = (data: any, status = 200) => new Response(JSON.stringify(data), {
-      headers: { ...corsHeaders, 'Content-Type': 'application/json' },
-      status
-    });
+    const respond = (data: unknown, status = 200) => jsonResponse(data, status, corsHeaders);
 
-    const secret = env.JWT_SECRET;
-    if (!secret) return jsonResponse({ error: 'Server misconfigured.' }, 500);
+    if (!env.JWT_SECRET) {
+      console.error('JWT_SECRET is missing.');
+      return respond({ error: 'Server misconfigured.' }, 500);
+    }
 
     try {
-      // -----------------------------------------------------------------
-      // 1. Auth Routing
-      // -----------------------------------------------------------------
-      if (url.pathname.startsWith('/api/auth/')) {
+      // ---------------------------------------------------------------------
+      // AUTH ROUTES
+      // ---------------------------------------------------------------------
 
-        // [POST] /api/auth/signup
+      if (url.pathname.startsWith('/api/auth/')) {
+        // POST /api/auth/signup
         if (request.method === 'POST' && url.pathname === '/api/auth/signup') {
           const body = await parseJsonBody(request);
-          if (!body) return jsonResponse({ error: 'Invalid request body.' }, 400);
+          if (!body) return respond({ error: 'Invalid request body.' }, 400);
 
           const { email, password, artistName } = body;
-          if (!isValidEmail(email)) return jsonResponse({ error: 'A valid email is required.' }, 400);
-          if (!isValidPassword(password)) return jsonResponse({ error: 'Password must be 8-128 characters.' }, 400);
-          if (!isNonEmptyString(artistName, 255)) return jsonResponse({ error: 'Artist name is required.' }, 400);
+
+          if (!isValidEmail(email)) {
+            return respond({ error: 'A valid email is required.' }, 400);
+          }
+
+          if (!isValidPassword(password)) {
+            return respond({ error: 'Password must be 8-128 characters.' }, 400);
+          }
+
+          if (!isNonEmptyString(artistName, 255)) {
+            return respond({ error: 'Artist name is required.' }, 400);
+          }
 
           const normalizedEmail = email.toLowerCase().trim();
+          const cleanArtistName = artistName.trim();
 
-          const existing = await env.DB.prepare('SELECT id FROM artists WHERE email = ?').bind(normalizedEmail).first();
-          if (existing) return jsonResponse({ error: 'An account with that email already exists.' }, 409);
+          const existing = await env.DB
+            .prepare('SELECT id FROM artists WHERE email = ?')
+            .bind(normalizedEmail)
+            .first();
 
-          const hash = await CryptoUtils.hashPassword(password);
-          await env.DB.prepare(
-            'INSERT INTO artists (id, email, password_hash, artist_name) VALUES (?, ?, ?, ?)'
-          ).bind(CryptoUtils.uuidv4(), normalizedEmail, hash, artistName.trim()).run();
+          if (existing) {
+            return respond({ error: 'An account with that email already exists.' }, 409);
+          }
 
-          return jsonResponse({ success: true }, 201);
+          const artistId = CryptoUtils.uuidv4();
+          const passwordHash = await CryptoUtils.hashPassword(password);
+
+          await env.DB
+            .prepare(
+              'INSERT INTO artists (id, email, password_hash, artist_name) VALUES (?, ?, ?, ?)',
+            )
+            .bind(artistId, normalizedEmail, passwordHash, cleanArtistName)
+            .run();
+
+          // A welcome email should not prevent account creation if delivery is
+          // temporarily unavailable. Delivery errors are visible in Worker logs.
+          try {
+            await sendWelcomeEmail(env, normalizedEmail, cleanArtistName);
+          } catch (emailError) {
+            console.error('Welcome email could not be sent:', emailError);
+          }
+
+          return respond({ success: true }, 201);
         }
 
-        // [POST] /api/auth/login
+        // POST /api/auth/login
         if (request.method === 'POST' && url.pathname === '/api/auth/login') {
           const body = await parseJsonBody(request);
-          if (!body) return jsonResponse({ error: 'Invalid request body.' }, 400);
+          if (!body) return respond({ error: 'Invalid request body.' }, 400);
 
           const { email, password } = body;
+
           if (!isValidEmail(email) || typeof password !== 'string' || !password) {
-            // Generic on purpose — don't tell the caller which field was wrong.
-            return jsonResponse({ error: 'Invalid email or password.' }, 401);
+            return respond({ error: 'Invalid email or password.' }, 401);
           }
 
-          const artist = await env.DB.prepare(
-            'SELECT id, password_hash FROM artists WHERE email = ?'
-          ).bind(email.toLowerCase().trim()).first<any>();
+          const artist = await env.DB
+            .prepare('SELECT id, password_hash FROM artists WHERE email = ?')
+            .bind(email.toLowerCase().trim())
+            .first<ArtistRecord>();
 
-          if (!artist || !(await CryptoUtils.verifyPassword(password, artist.password_hash))) {
-            return jsonResponse({ error: 'Invalid email or password.' }, 401);
+          if (
+            !artist ||
+            typeof artist.id !== 'string' ||
+            typeof artist.password_hash !== 'string' ||
+            !(await CryptoUtils.verifyPassword(password, artist.password_hash))
+          ) {
+            return respond({ error: 'Invalid email or password.' }, 401);
           }
 
-          return jsonResponse({ token: await CryptoUtils.generateToken({ artistId: artist.id }, secret) });
+          const token = await CryptoUtils.generateToken({ artistId: artist.id }, env.JWT_SECRET);
+          return respond({ token });
         }
 
-        // [POST] /api/auth/forgot
+        // POST /api/auth/forgot
         if (request.method === 'POST' && url.pathname === '/api/auth/forgot') {
           const body = await parseJsonBody(request);
-          if (!body) return jsonResponse({ error: 'Invalid request body.' }, 400);
+          if (!body) return respond({ error: 'Invalid request body.' }, 400);
 
           const { email } = body;
-          // Same response regardless of validity/match — avoids leaking
-          // which emails have accounts (enumeration).
+
+          // Always return the same response. This prevents account enumeration.
           if (isValidEmail(email)) {
             const normalizedEmail = email.toLowerCase().trim();
-            const artist = await env.DB.prepare('SELECT id FROM artists WHERE email = ?').bind(normalizedEmail).first<any>();
-            if (artist) {
-              const token = CryptoUtils.generateResetToken();
-              const expiresAt = new Date(Date.now() + 60 * 60 * 1000).toISOString();
-              await env.DB.prepare(
-                'INSERT INTO password_resets (id, artist_id, token, expires_at) VALUES (?, ?, ?, ?)'
-              ).bind(CryptoUtils.uuidv4(), artist.id, token, expiresAt).run();
 
-              // TODO: wire this up to real email delivery (Resend, Postmark,
-              // MailChannels, etc). Right now the token is only ever
-              // surfaced in dev logs — no email is actually sent yet.
-              if (env.ENVIRONMENT === 'development') {
-                console.log(`[DEV ONLY] Reset token for ${normalizedEmail}: ${token}`);
+            const artist = await env.DB
+              .prepare('SELECT id FROM artists WHERE email = ?')
+              .bind(normalizedEmail)
+              .first<ArtistRecord>();
+
+            if (artist && typeof artist.id === 'string') {
+              const token = CryptoUtils.generateResetToken();
+              const expiresAt = new Date(Date.now() + RESET_TOKEN_TTL_MS).toISOString();
+              const resetUrl = getResetUrl(env.APP_URL, token);
+
+              // A user only needs one active reset link. Old unused links for
+              // the same artist become invalid when a new reset is requested.
+              await env.DB.batch([
+                env.DB
+                  .prepare('DELETE FROM password_resets WHERE artist_id = ? AND used = 0')
+                  .bind(artist.id),
+                env.DB
+                  .prepare(
+                    'INSERT INTO password_resets (id, artist_id, token, expires_at, used) VALUES (?, ?, ?, ?, 0)',
+                  )
+                  .bind(CryptoUtils.uuidv4(), artist.id, token, expiresAt),
+              ]);
+
+              try {
+                await sendPasswordResetEmail(env, normalizedEmail, resetUrl);
+              } catch (emailError) {
+                // Never expose email delivery details to the requesting user.
+                // Check Worker logs + Resend Logs to diagnose delivery issues.
+                console.error('Password reset email could not be sent:', emailError);
               }
             }
           }
-          return jsonResponse({ message: 'If that email has an account, a reset link is on its way.' });
+
+          return respond({
+            message: 'If that email has an account, a reset link is on its way.',
+          });
         }
 
-        // [POST] /api/auth/reset
+        // POST /api/auth/reset
         if (request.method === 'POST' && url.pathname === '/api/auth/reset') {
           const body = await parseJsonBody(request);
-          if (!body) return jsonResponse({ error: 'Invalid request body.' }, 400);
+          if (!body) return respond({ error: 'Invalid request body.' }, 400);
 
           const { token, newPassword } = body;
+
           if (!isNonEmptyString(token, 128) || !isValidPassword(newPassword)) {
-            return jsonResponse({ error: 'Invalid or expired reset link.' }, 400);
+            return respond({ error: 'Invalid or expired reset link.' }, 400);
           }
 
-          const resetRecord = await env.DB.prepare(
-            'SELECT artist_id, expires_at, used FROM password_resets WHERE token = ?'
-          ).bind(token).first<any>();
+          const resetRecord = await env.DB
+            .prepare(
+              'SELECT artist_id, expires_at, used FROM password_resets WHERE token = ?',
+            )
+            .bind(token)
+            .first<PasswordResetRecord>();
 
-          // Same generic error for "not found", "already used", and
-          // "expired" — an attacker probing tokens learns nothing from the
-          // response about which case they hit.
-          const invalid =
+          const alreadyUsed = resetRecord?.used === 1 || resetRecord?.used === true;
+          const expired =
             !resetRecord ||
-            resetRecord.used === 1 ||
-            new Date() > new Date(resetRecord.expires_at);
+            typeof resetRecord.expires_at !== 'string' ||
+            Number.isNaN(Date.parse(resetRecord.expires_at)) ||
+            Date.now() > new Date(resetRecord.expires_at).getTime();
 
-          if (invalid) {
-            return jsonResponse({ error: 'Invalid or expired reset link.' }, 400);
+          if (!resetRecord || alreadyUsed || expired || typeof resetRecord.artist_id !== 'string') {
+            return respond({ error: 'Invalid or expired reset link.' }, 400);
           }
 
           const updatedHash = await CryptoUtils.hashPassword(newPassword);
+
           await env.DB.batch([
-            env.DB.prepare('UPDATE artists SET password_hash = ? WHERE id = ?').bind(updatedHash, resetRecord.artist_id),
-            env.DB.prepare('UPDATE password_resets SET used = 1 WHERE token = ?').bind(token),
+            env.DB
+              .prepare('UPDATE artists SET password_hash = ? WHERE id = ?')
+              .bind(updatedHash, resetRecord.artist_id),
+            env.DB
+              .prepare('UPDATE password_resets SET used = 1 WHERE token = ?')
+              .bind(token),
           ]);
 
-          return jsonResponse({ success: true, message: 'Password updated. You can now sign in.' });
+          return respond({
+            success: true,
+            message: 'Password updated. You can now sign in.',
+          });
         }
+
+        return respond({ error: 'Not found.' }, 404);
       }
 
-      // -----------------------------------------------------------------
-      // 2. Auth Middleware
-      // -----------------------------------------------------------------
-      const authHeader = request.headers.get("Authorization");
-      if (!authHeader?.startsWith("Bearer ")) return jsonResponse({ error: "Access denied." }, 401);
+      // ---------------------------------------------------------------------
+      // PROTECTED LEDGER ROUTES
+      // ---------------------------------------------------------------------
 
-      const session = await CryptoUtils.verifyToken(authHeader.split(" ")[1], secret);
-      if (!session) return jsonResponse({ error: "Invalid or expired session." }, 401);
+      const authHeader = request.headers.get('Authorization');
 
-      // -----------------------------------------------------------------
-      // 3. Protected Ledger Routes
-      // -----------------------------------------------------------------
-      if (url.pathname === '/api/transactions') {
-        if (request.method === 'GET') {
-          // LIMIT is a basic safety net, not real pagination — worth
-          // revisiting with proper offset/cursor pagination once artists
-          // start accumulating thousands of sessions.
-          const { results } = await env.DB.prepare(
-            'SELECT * FROM transactions WHERE artist_id = ? ORDER BY timestamp DESC LIMIT 1000'
-          ).bind(session.artistId).all();
-          return jsonResponse(results);
+      if (!authHeader?.startsWith('Bearer ')) {
+        return respond({ error: 'Access denied.' }, 401);
+      }
+
+      const session = await CryptoUtils.verifyToken(
+        authHeader.slice('Bearer '.length),
+        env.JWT_SECRET,
+      );
+
+      if (!session) {
+        return respond({ error: 'Invalid or expired session.' }, 401);
+      }
+
+      // GET /api/transactions
+      if (url.pathname === '/api/transactions' && request.method === 'GET') {
+        const { results } = await env.DB
+          .prepare(
+            'SELECT * FROM transactions WHERE artist_id = ? ORDER BY timestamp DESC LIMIT 1000',
+          )
+          .bind(session.artistId)
+          .all();
+
+        return respond(results);
+      }
+
+      // POST /api/transactions
+      if (url.pathname === '/api/transactions' && request.method === 'POST') {
+        const body = await parseJsonBody(request);
+        if (!body) return respond({ error: 'Invalid request body.' }, 400);
+
+        const validated = validateTransactionPayload(body);
+        if (!validated.ok) {
+          return respond({ error: validated.error }, 400);
         }
 
-        if (request.method === 'POST') {
-          const body = await parseJsonBody(request);
-          if (!body) return jsonResponse({ error: 'Invalid request body.' }, 400);
+        const transaction = validated.value;
+        const netAmount =
+          Math.round(
+            transaction.grossAmount * (1 - transaction.shopCutPercentage / 100) * 100,
+          ) / 100;
 
-          const validated = validateTransactionPayload(body);
-          if (!validated.ok) return jsonResponse({ error: validated.error }, 400);
-
-          const tx = validated.value;
-          // Net is computed server-side rather than trusted from the
-          // client, so a tampered payload can't record a net amount that
-          // doesn't match gross/cut.
-          const netAmount = Math.round(tx.grossAmount * (1 - tx.shopCutPercentage / 100) * 100) / 100;
-
-          await env.DB.prepare(
+        await env.DB
+          .prepare(
             `INSERT INTO transactions
              (id, artist_id, timestamp, clientName, description, incomeType, paymentMethod, grossAmount, shopCutPercentage, netAmount)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-          ).bind(
-            tx.id, session.artistId, tx.timestamp, tx.clientName, tx.description,
-            tx.incomeType, tx.paymentMethod, tx.grossAmount, tx.shopCutPercentage, netAmount
-          ).run();
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          )
+          .bind(
+            transaction.id,
+            session.artistId,
+            transaction.timestamp,
+            transaction.clientName,
+            transaction.description,
+            transaction.incomeType,
+            transaction.paymentMethod,
+            transaction.grossAmount,
+            transaction.shopCutPercentage,
+            netAmount,
+          )
+          .run();
 
-          return jsonResponse({ success: true, id: tx.id, netAmount }, 201);
-        }
+        return respond({ success: true, id: transaction.id, netAmount }, 201);
       }
 
-      return jsonResponse({ error: 'Not found' }, 404);
-    } catch (e: any) {
-      // Log the real error server-side for debugging, but never echo raw
-      // error internals (DB constraint text, stack traces, etc.) back to
-      // the client.
-      console.error('Unhandled worker error:', e);
-      return jsonResponse({ error: 'Internal server error.' }, 500);
+      return respond({ error: 'Not found.' }, 404);
+    } catch (error) {
+      console.error('Unhandled worker error:', error);
+      return respond({ error: 'Internal server error.' }, 500);
     }
-  }
+  },
 };

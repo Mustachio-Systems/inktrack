@@ -1,26 +1,42 @@
 export type IncomeType = 'appointment' | 'walk-in' | 'deposit' | 'tip';
 
-// Fully updated to capture PR and global transaction vectors natively
-export type PaymentMethod = 'cash' | 'card' | 'ath-movil' | 'zelle' | 'venmo' | 'paypal';
+export type PaymentMethod =
+  | 'cash'
+  | 'card'
+  | 'ath-movil'
+  | 'zelle'
+  | 'venmo'
+  | 'paypal';
+
+export type ShopFeeType =
+  | 'percentage'
+  | 'fixed'
+  | 'booth-rent'
+  | 'hybrid'
+  | 'none';
+
+export type ShopExpenseFrequency = 'weekly' | 'monthly' | 'one-time';
 
 export interface Transaction {
   id: string;
-  timestamp: string; 
+  timestamp: string;
   clientName?: string;
-  description?: string;
+  description?: string | null;
   incomeType: IncomeType;
   paymentMethod: PaymentMethod;
   grossAmount: number;
-  shopCutPercentage: number; 
-  netAmount: number; 
+  shopFeeType?: ShopFeeType;
+  shopCutPercentage: number;
+  shopFixedFee?: number;
+  netAmount: number;
 }
 
-export interface DashboardMetrics {
-  currentHour: number;
-  daily: number;
-  weekly: number;
-  biWeekly: number;
-  monthly: number;
-  threeMonth: number;
-  yearly: number;
+export interface ShopExpense {
+  id: string;
+  name: string;
+  amount: number;
+  frequency: ShopExpenseFrequency;
+  startsOn: string;
+  endsOn: string | null;
+  createdAt?: string;
 }

@@ -558,28 +558,71 @@ export default function Dashboard({ setAuth }: DashboardProps) {
 
   const handleImportData = (event: ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
+
     if (!file) return;
 
+    const inputElement = event.target;
     const reader = new FileReader();
 
-    reader.onload = (loadEvent) => {
+    reader.onload = async (loadEvent) => {
       try {
         const parsed = JSON.parse(loadEvent.target?.result as string);
 
         if (!Array.isArray(parsed)) {
-          triggerStatus('error', 'File format mismatch — expected a ledger array.');
+          triggerStatus('error', 'File format mismatch — expected a ledger backup array.');
           return;
         }
 
-        const imported = parsed as Transaction[];
-        setTransactions(imported);
-        localStorage.setItem('inktrack_ledger', JSON.stringify(imported));
-        triggerStatus('success', `Imported ${imported.length} ledger entries.`);
+        if (parsed.length === 0) {
+          triggerStatus('error', 'This backup file has no sessions to restore.');
+          return;
+        }
+
+        const confirmed = window.confirm(
+          `Restore ${parsed.length} session(s) to your cloud ledger?\n\nExisting sessions with matching IDs will be updated.`,
+        );
+
+        if (!confirmed) return;
+
+        const response = await authFetch(`${API_URL}/import`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            transactions: parsed,
+          }),
+        });
+
+        const result = (await response.json()) as {
+          error?: string;
+          restored?: number;
+          message?: string;
+        };
+
+        if (!response.ok) {
+          throw new Error(result.error || 'Could not restore the backup.');
+        }
+
+        // Re-read the actual D1 data. Do not rely on localStorage as the source of truth.
+        await fetchLedger();
+
+        triggerStatus(
+          'success',
+          result.message || `Restored ${result.restored || parsed.length} session(s).`,
+        );
       } catch (error) {
         console.error(error);
-        triggerStatus('error', 'Could not read the backup file.');
+
+        triggerStatus(
+          'error',
+          error instanceof Error
+            ? error.message
+            : 'Could not read or restore the backup file.',
+        );
       } finally {
-        event.target.value = '';
+        // Lets the user select the same backup again later.
+        inputElement.value = '';
       }
     };
 

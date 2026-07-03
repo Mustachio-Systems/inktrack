@@ -486,6 +486,68 @@ export default {
             if (!session) {
                 return respond({ error: 'Invalid or expired session.' }, 401);
             }
+            // POST /api/transactions/import
+            if (url.pathname === '/api/transactions/import' && request.method === 'POST') {
+                const body = await parseJsonBody(request);
+                if (!body || !Array.isArray(body.transactions)) {
+                    return respond({ error: 'Expected a transactions array.' }, 400);
+                }
+                if (body.transactions.length === 0) {
+                    return respond({ error: 'The backup file contains no sessions.' }, 400);
+                }
+                if (body.transactions.length > 1000) {
+                    return respond({ error: 'A backup can contain at most 1,000 sessions.' }, 400);
+                }
+                const restoredTransactions = [];
+                for (const rawTransaction of body.transactions) {
+                    const validated = validateTransactionPayload(rawTransaction);
+                    if (!validated.ok) {
+                        return respond({
+                            error: `Backup contains an invalid session: ${validated.error}`,
+                        }, 400);
+                    }
+                    restoredTransactions.push(validated.value);
+                }
+                const statements = restoredTransactions.map((transaction) => {
+                    const netAmount = Math.round(transaction.grossAmount *
+                        (1 - transaction.shopCutPercentage / 100) *
+                        100) / 100;
+                    return env.DB
+                        .prepare(`INSERT INTO transactions
+                (
+                  id,
+                  artist_id,
+                  timestamp,
+                  clientName,
+                  description,
+                  incomeType,
+                  paymentMethod,
+                  grossAmount,
+                  shopCutPercentage,
+                  netAmount
+                )
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+
+              ON CONFLICT(id) DO UPDATE SET
+                timestamp = excluded.timestamp,
+                clientName = excluded.clientName,
+                description = excluded.description,
+                incomeType = excluded.incomeType,
+                paymentMethod = excluded.paymentMethod,
+                grossAmount = excluded.grossAmount,
+                shopCutPercentage = excluded.shopCutPercentage,
+                netAmount = excluded.netAmount
+
+              WHERE transactions.artist_id = excluded.artist_id`)
+                        .bind(transaction.id, session.artistId, transaction.timestamp, transaction.clientName, transaction.description, transaction.incomeType, transaction.paymentMethod, transaction.grossAmount, transaction.shopCutPercentage, netAmount);
+                });
+                await env.DB.batch(statements);
+                return respond({
+                    success: true,
+                    restored: restoredTransactions.length,
+                    message: `Restored ${restoredTransactions.length} session(s) to your ledger.`,
+                });
+            }
             // GET /api/transactions
             if (url.pathname === '/api/transactions' && request.method === 'GET') {
                 const { results } = await env.DB

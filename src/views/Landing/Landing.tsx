@@ -8,6 +8,7 @@ import {
   Clock,
   Receipt,
   ArrowRight,
+  Coffee,
 } from 'lucide-react';
 
 // Flash-sheet-style feature entries. Design numbers are decorative
@@ -291,16 +292,32 @@ export default function Landing() {
         {/* Footer signage */}
         <footer className="border-t border-[#EFE7D8]/10 bg-[#16130F]">
           <div className="max-w-6xl mx-auto px-6 py-10 flex flex-col md:flex-row justify-between items-center gap-6">
-            <p className="text-xs text-[#EFE7D8]/40 font-mono-ledger text-center md:text-left">
-              &copy; 2026 inktrack. Built on Cloudflare. Your numbers, your
-              ledger, always yours.
-            </p>
+            <div className="text-center md:text-left">
+              <p className="text-xs text-[#EFE7D8]/40 font-mono-ledger">
+                &copy; 2026 inktrack. Built on Cloudflare. Your numbers, your
+                ledger, always yours.
+              </p>
+
+              <a
+                href="https://buymeacoffee.com/MustachioSystems"
+                target="_blank"
+                rel="noopener noreferrer"
+                className="mt-3 inline-flex items-center gap-2 rounded-sm border border-[#C39A48]/35 bg-[#C39A48]/[0.06] px-3 py-2 font-mono-ledger text-[10px] font-semibold uppercase tracking-wide text-[#C39A48] transition-colors hover:border-[#C39A48]/70 hover:bg-[#C39A48]/15 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#C39A48]"
+              >
+                <Coffee className="h-3.5 w-3.5" />
+                Support InkTrack
+              </a>
+            </div>
+
             <div className="flex justify-center gap-6 text-xs text-[#EFE7D8]/50 font-mono-ledger uppercase tracking-wide">
               <span className="flex items-center gap-1.5">
-                <ShieldCheck className="w-3.5 h-3.5 text-[#C39A48]" /> Encrypted
+                <ShieldCheck className="w-3.5 h-3.5 text-[#C39A48]" />
+                Encrypted
               </span>
+
               <span className="flex items-center gap-1.5">
-                <Clock className="w-3.5 h-3.5 text-[#C39A48]" /> Real-time sync
+                <Clock className="w-3.5 h-3.5 text-[#C39A48]" />
+                Real-time sync
               </span>
             </div>
           </div>

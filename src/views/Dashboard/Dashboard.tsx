@@ -493,20 +493,21 @@ export default function Dashboard({ setAuth }: DashboardProps) {
                   <label className="block text-[11px] font-mono-ledger font-semibold text-[#16130F]/50 uppercase tracking-wider mb-2">
                     Gross Amount Collected
                   </label>
+
                   <div className="relative">
-                    <DollarSign className="absolute left-4 top-3.5 h-5 w-5 text-[#A83A2C]" />
+                    <DollarSign className="pointer-events-none absolute left-4 top-3.5 h-5 w-5 text-[#A83A2C]" />
+
                     <input
-                      type="text"
+                      type="number"
                       inputMode="decimal"
-                      pattern="[0-9]*[.,]?[0-9]*"
+                      min="0"
+                      step="0.01"
                       required
+                      autoFocus
                       value={grossAmount}
-                      onChange={e => {
-                        const sanitized = e.target.value.replace(/[^0-9.]/g, '');
-                        setGrossAmount(sanitized);
-                      }}
+                      onChange={(e) => setGrossAmount(e.target.value)}
                       placeholder="0.00"
-                      className="w-full bg-white border border-[#16130F]/15 rounded-sm py-3.5 pl-12 pr-4 text-lg font-mono-ledger font-bold focus:outline-none focus:border-[#A83A2C] text-[#16130F]"
+                      className="w-full bg-white border border-[#16130F]/15 rounded-sm py-3.5 pl-12 pr-4 text-lg font-mono-ledger font-bold text-[#16130F] focus:outline-none focus:border-[#A83A2C]"
                     />
                   </div>
                 </div>

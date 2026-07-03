@@ -1,22 +1,30 @@
 import { useState, useMemo, useEffect, useRef } from 'react';
 // 🛡️ Enforce explicit type-only imports to satisfy verbatimModuleSyntax standards
 import type { Transaction, IncomeType, PaymentMethod } from '../../types/ledger';
-import { 
-  DollarSign, 
-  Plus, 
-  LogOut, 
-  Wallet, 
-  Percent, 
-  Download, 
-  Upload, 
+import {
+  DollarSign,
+  Plus,
+  LogOut,
+  Wallet,
+  Percent,
+  Download,
+  Upload,
   CheckCircle2,
   AlertCircle,
-  RefreshCw
+  RefreshCw,
+  X,
 } from 'lucide-react';
 
 interface DashboardProps {
   setAuth: (val: boolean) => void;
 }
+
+const INCOME_TAG_STYLES: Record<IncomeType, string> = {
+  appointment: 'bg-[#3F6B62]/15 text-[#2F544A] border-[#3F6B62]/40',
+  'walk-in': 'bg-[#C39A48]/15 text-[#8A6A2F] border-[#C39A48]/40',
+  deposit: 'bg-[#16130F]/10 text-[#16130F]/70 border-[#16130F]/20',
+  tip: 'bg-[#A83A2C]/10 text-[#A83A2C] border-[#A83A2C]/30',
+};
 
 export default function Dashboard({ setAuth }: DashboardProps) {
   // Dynamic API routing boundary: automatically falls back to local simulator if running in dev mode
@@ -30,27 +38,47 @@ export default function Dashboard({ setAuth }: DashboardProps) {
 
   // UI State Managers
   const [isModalOpen, setIsModalOpen] = useState(false);
+  const [isSubmitting, setIsSubmitting] = useState(false);
   const [statusMessage, setStatusMessage] = useState<{type: 'success' | 'error', text: string} | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
-  
+
   // Transaction Input Buffer states
   const [grossAmount, setGrossAmount] = useState('');
   const [incomeType, setIncomeType] = useState<IncomeType>('appointment');
   const [paymentMethod, setPaymentMethod] = useState<PaymentMethod>('cash');
   const [clientName, setClientName] = useState('');
-  const [shopCut, setShopCut] = useState('40'); 
+  const [shopCut, setShopCut] = useState('40');
   const [description, setDescription] = useState('');
+
+  // 🔐 Auth-aware fetch wrapper. Attaches the session token and forces a
+  // logout if the API reports the token is missing/expired, instead of
+  // silently failing and masking it behind the local cache fallback.
+  const authFetch = async (url: string, options: RequestInit = {}) => {
+    const token = localStorage.getItem('inktrack_token');
+    const response = await fetch(url, {
+      ...options,
+      headers: {
+        ...(options.headers || {}),
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      },
+    });
+    if (response.status === 401) {
+      localStorage.removeItem('inktrack_token');
+      setAuth(false);
+    }
+    return response;
+  };
 
   // 🔄 ASYNC INITIALIZATION LINK: Read database records on boot
   const fetchLedger = async () => {
     setIsLoading(true);
     try {
-      const response = await fetch(API_URL);
+      const response = await authFetch(API_URL);
       if (!response.ok) throw new Error('Data sync exception');
-      
+
       // 🛡️ Resolve 'unknown' assignment by explicitly asserting the data shape array structure
       const data = (await response.json()) as Transaction[];
-      
+
       setTransactions(data);
       // Synchronize backing store for local offline redundancy
       localStorage.setItem('inktrack_ledger', JSON.stringify(data));
@@ -72,6 +100,7 @@ export default function Dashboard({ setAuth }: DashboardProps) {
 
   useEffect(() => {
     fetchLedger();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // 🧮 Time-Interval Calculation Matrix Engine
@@ -85,7 +114,7 @@ export default function Dashboard({ setAuth }: DashboardProps) {
       const diffHours = diffMs / (1000 * 60 * 60);
       const diffDays = diffHours / 24;
 
-      const val = t.netAmount; 
+      const val = t.netAmount;
 
       if (diffHours <= 1) hr += val;
       if (diffDays <= 1) day += val;
@@ -102,6 +131,8 @@ export default function Dashboard({ setAuth }: DashboardProps) {
   // Form Submission
   const handleLogIncome = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (isSubmitting) return;
+
     const gross = parseFloat(grossAmount);
     if (isNaN(gross) || gross <= 0) return;
 
@@ -120,18 +151,20 @@ export default function Dashboard({ setAuth }: DashboardProps) {
       netAmount: net,
     };
 
+    setIsSubmitting(true);
+
     // 🛡️ OPTIMISTIC UI COMMIT PROTOCOL: Update state instantly for sleek viewport experience
     const baselineBackup = [...transactions];
     setTransactions([newTx, ...transactions]);
     setIsModalOpen(false);
-    
+
     // Clear field buffers immediately
     setGrossAmount('');
     setClientName('');
     setDescription('');
 
     try {
-      const response = await fetch(API_URL, {
+      const response = await authFetch(API_URL, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(newTx),
@@ -141,11 +174,13 @@ export default function Dashboard({ setAuth }: DashboardProps) {
 
       // Update redundant local storage state tracking
       localStorage.setItem('inktrack_ledger', JSON.stringify([newTx, ...baselineBackup]));
-      triggerStatus('success', 'Session securely committed to Cloudflare D1.');
+      triggerStatus('success', 'Session stamped into the ledger.');
     } catch (err) {
       // Rollback UI layout instantly on transaction write exception to preserve structural data integrity
       setTransactions(baselineBackup);
-      triggerStatus('error', 'Database synchronization failure. State safely rolled back.');
+      triggerStatus('error', 'Write failed — entry rolled back. Try again.');
+    } finally {
+      setIsSubmitting(false);
     }
   };
 
@@ -161,15 +196,15 @@ export default function Dashboard({ setAuth }: DashboardProps) {
       const dataStr = "data:text/json;charset=utf-8," + encodeURIComponent(JSON.stringify(transactions, null, 2));
       const downloadAnchor = document.createElement('a');
       const dateStamp = new Date().toISOString().split('T')[0];
-      
+
       downloadAnchor.setAttribute("href", dataStr);
       downloadAnchor.setAttribute("download", `inktrack_ledger_${dateStamp}.json`);
       document.body.appendChild(downloadAnchor);
       downloadAnchor.click();
       downloadAnchor.remove();
-      triggerStatus('success', 'Ledger backup JSON generated successfully.');
+      triggerStatus('success', 'Ledger backup exported.');
     } catch (err) {
-      triggerStatus('error', 'Export calculation script ran into an error.');
+      triggerStatus('error', 'Export ran into an error.');
     }
   };
 
@@ -186,261 +221,390 @@ export default function Dashboard({ setAuth }: DashboardProps) {
           const validatedData = parsed as Transaction[];
           setTransactions(validatedData);
           localStorage.setItem('inktrack_ledger', JSON.stringify(validatedData));
-          triggerStatus('success', `Import verified: Loaded ${validatedData.length} ledger logs.`);
+          triggerStatus('success', `Import verified: loaded ${validatedData.length} entries.`);
         } else {
-          triggerStatus('error', 'Format mismatch: File array format invalid.');
+          triggerStatus('error', 'File format mismatch — expected an array.');
         }
       } catch (err) {
-        triggerStatus('error', 'Failed to read file. Verify JSON syntax values.');
+        triggerStatus('error', 'Could not read file. Check the JSON syntax.');
       }
     };
     reader.readAsText(file);
   };
 
+  const handleLogout = () => {
+    localStorage.removeItem('inktrack_token');
+    setAuth(false);
+  };
+
+  const money = (n: number) => n.toFixed(2);
+
   return (
-    <div className="bg-zinc-950 text-zinc-50 min-h-screen font-sans selection:bg-emerald-500 selection:text-zinc-950">
-      
-      {/* Universal Flash Context Notification */}
-      {statusMessage && (
-        <div className={`fixed top-24 right-6 z-50 flex items-center gap-2 border px-4 py-3 rounded-xl shadow-xl transition-all animate-fade-in-up ${
-          statusMessage.type === 'success' ? 'bg-zinc-900 border-emerald-500/30 text-emerald-400' : 'bg-zinc-900 border-red-500/30 text-red-400'
-        }`}>
-          {statusMessage.type === 'success' ? <CheckCircle2 className="w-4 h-4" /> : <AlertCircle className="w-4 h-4" />}
-          <span className="text-xs font-bold">{statusMessage.text}</span>
-        </div>
-      )}
+    <div className="bg-[#16130F] text-[#EFE7D8] min-h-screen font-[Inter,sans-serif] selection:bg-[#A83A2C] selection:text-[#EFE7D8]">
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=Rye&family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap');
+        .font-display { font-family: 'Rye', serif; }
+        .font-mono-ledger { font-family: 'IBM Plex Mono', monospace; }
+        .font-body { font-family: 'IBM Plex Sans', sans-serif; }
+      `}</style>
 
-      {/* Nav */}
-      <nav className="border-b border-zinc-900 bg-zinc-900/30 backdrop-blur-md sticky top-0 z-40 px-6 py-4 flex justify-between items-center">
-        <div className="flex items-center gap-3">
-          <div className="h-7 w-7 bg-emerald-500 rounded-md flex items-center justify-center font-black text-zinc-950 text-sm">i</div>
-          <span className="font-black text-lg tracking-tight">inktrack<span className="text-emerald-400">.</span>Console</span>
-        </div>
-        <div className="flex items-center gap-4">
-          <button 
-            onClick={fetchLedger}
-            title="Force refresh ledger from database"
-            className="text-zinc-500 hover:text-emerald-400 p-2 transition-colors flex items-center justify-center"
+      <div className="font-body">
+        {/* Flash notification */}
+        {statusMessage && (
+          <div
+            role="status"
+            className={`fixed top-6 right-6 z-50 flex items-center gap-2 border px-4 py-3 rounded-md shadow-xl transition-all ${
+              statusMessage.type === 'success'
+                ? 'bg-[#EFE7D8] border-[#3F6B62]/40 text-[#2F544A]'
+                : 'bg-[#EFE7D8] border-[#A83A2C]/40 text-[#A83A2C]'
+            }`}
           >
-            <RefreshCw className={`w-4 h-4 ${isLoading ? 'animate-spin text-emerald-400' : ''}`} />
-          </button>
-          <button 
-            onClick={() => setIsModalOpen(true)}
-            className="bg-emerald-500 hover:bg-emerald-600 text-zinc-950 font-bold px-4 py-2 rounded-xl text-sm flex items-center gap-2 transition-all shadow-lg"
-          >
-            <Plus className="w-4 h-4 stroke-[3]" /> Log Session
-          </button>
-          <button onClick={() => setAuth(false)} className="text-zinc-500 hover:text-zinc-300 p-2 transition-colors">
-            <LogOut className="w-5 h-5" />
-          </button>
-        </div>
-      </nav>
-
-      <main className="max-w-7xl mx-auto px-6 py-10 space-y-10">
-        
-        {/* Metric Rollup Matrix */}
-        <section>
-          <h2 className="text-sm font-bold uppercase tracking-widest text-zinc-500 mb-4">Earnings Rollup Matrix (Take-Home Net)</h2>
-          <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-7 gap-4">
-            {[
-              { label: 'Hour Rate', val: metrics.hr },
-              { label: 'Today', val: metrics.day, highlight: true },
-              { label: 'This Week', val: metrics.wk },
-              { label: 'Bi-Weekly', val: metrics.biWk },
-              { label: 'Monthly', val: metrics.mo },
-              { label: '3 Months', val: metrics.triMo },
-              { label: 'Yearly Estimate', val: metrics.yr },
-            ].map((card, idx) => (
-              <div key={idx} className={`p-4 rounded-xl border ${card.highlight ? 'bg-zinc-900 border-emerald-500/30 shadow-lg' : 'bg-zinc-900/40 border-zinc-900'}`}>
-                <span className="text-xs font-semibold text-zinc-500 block mb-1">{card.label}</span>
-                <span className={`text-xl font-bold tracking-tight ${card.highlight ? 'text-emerald-400' : 'text-zinc-100'}`}>
-                  ${card.val.toFixed(2)}
-                </span>
-              </div>
-            ))}
+            {statusMessage.type === 'success' ? <CheckCircle2 className="w-4 h-4" /> : <AlertCircle className="w-4 h-4" />}
+            <span className="font-mono-ledger text-xs font-semibold">{statusMessage.text}</span>
           </div>
-        </section>
+        )}
 
-        {/* Action Layout splits */}
-        <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
-          
-          {/* Main Feed */}
-          <div className="lg:col-span-2 space-y-4">
-            <h3 className="text-sm font-bold uppercase tracking-widest text-zinc-500">Real-time Session Feed</h3>
-            <div className="bg-zinc-900/30 border border-zinc-900 rounded-2xl overflow-hidden">
-              {isLoading ? (
-                <div className="p-12 text-center text-zinc-500 text-sm flex flex-col items-center justify-center gap-3">
-                  <RefreshCw className="w-5 h-5 animate-spin text-emerald-500" />
-                  Synchronizing transaction ledger structures...
-                </div>
-              ) : transactions.length === 0 ? (
-                <div className="p-8 text-center text-zinc-600 text-sm">No transaction instances recorded.</div>
-              ) : (
-                <div className="divide-y divide-zinc-900">
-                  {transactions.map((t) => (
-                    <div key={t.id} className="p-5 flex items-center justify-between hover:bg-zinc-900/40 transition-colors">
-                      <div className="space-y-1">
-                        <div className="flex items-center gap-2">
-                          <span className="font-bold text-zinc-200 text-sm">{t.clientName}</span>
-                          <span className={`text-[10px] px-2 py-0.5 rounded-full border font-medium uppercase tracking-wide ${
-                            t.incomeType === 'walk-in' ? 'bg-amber-950/40 text-amber-400 border-amber-900/50' : 'bg-blue-950/40 text-blue-400 border-blue-900/50'
-                          }`}>
-                            {t.incomeType}
-                          </span>
-                        </div>
-                        
-                        <div className="flex items-center gap-2 mt-1 flex-wrap">
-                          <p className="text-xs text-zinc-500">{t.description || 'No job context provided'}</p>
-                          <span className="text-[10px] bg-zinc-950 text-zinc-400 px-2 py-0.5 rounded border border-zinc-800 font-mono font-bold">
-                            {t.paymentMethod === 'ath-movil' ? '⚡ ATH MÓVIL' : `💳 ${t.paymentMethod.toUpperCase()}`}
-                          </span>
-                        </div>
-
-                        <p className="text-[10px] text-zinc-600 font-mono">{new Date(t.timestamp).toLocaleTimeString()}</p>
-                      </div>
-                      <div className="text-right">
-                        <span className="text-sm font-bold text-emerald-400 block">+${t.netAmount.toFixed(2)}</span>
-                        {t.shopCutPercentage > 0 && (
-                          <span className="text-[10px] text-zinc-500 block font-mono">Gross: ${t.grossAmount} (-{t.shopCutPercentage}%)</span>
-                        )}
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              )}
+        {/* Nav */}
+        <nav className="border-b border-[#EFE7D8]/10 bg-[#16130F]/95 backdrop-blur-md sticky top-0 z-40 px-6 py-4 flex justify-between items-center">
+          <div className="flex items-center gap-2.5">
+            <div className="h-8 w-8 rounded-full border-2 border-[#C39A48] bg-[#A83A2C] flex items-center justify-center font-display text-base">
+              i
             </div>
+            <span className="font-display text-lg tracking-wide">
+              inktrack<span className="text-[#C39A48]">.</span>
+              <span className="font-mono-ledger text-[11px] text-[#EFE7D8]/50 tracking-widest align-middle ml-1 uppercase">
+                Console
+              </span>
+            </span>
           </div>
+          <div className="flex items-center gap-2">
+            <button
+              onClick={fetchLedger}
+              title="Refresh ledger from database"
+              className="text-[#EFE7D8]/50 hover:text-[#C39A48] p-2.5 transition-colors rounded-md focus-visible:outline focus-visible:outline-2 focus-visible:outline-[#C39A48]"
+            >
+              <RefreshCw className={`w-4 h-4 ${isLoading ? 'animate-spin text-[#C39A48]' : ''}`} />
+            </button>
+            <button
+              onClick={() => setIsModalOpen(true)}
+              className="bg-[#A83A2C] hover:bg-[#c04430] text-[#EFE7D8] font-bold px-4 py-2.5 rounded-md text-sm flex items-center gap-2 transition-colors shadow-md active:scale-[0.97] focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#C39A48]"
+            >
+              <Plus className="w-4 h-4 stroke-[3]" /> Log Session
+            </button>
+            <button
+              onClick={handleLogout}
+              title="Sign out"
+              className="text-[#EFE7D8]/50 hover:text-[#A83A2C] p-2.5 transition-colors rounded-md focus-visible:outline focus-visible:outline-2 focus-visible:outline-[#C39A48]"
+            >
+              <LogOut className="w-5 h-5" />
+            </button>
+          </div>
+        </nav>
 
-          {/* Right Panels Sidebars */}
-          <div className="space-y-6">
-            
-            {/* Efficiency Box */}
-            <div>
-              <h3 className="text-sm font-bold uppercase tracking-widest text-zinc-500 mb-3">Shop Efficiency Diagnostics</h3>
-              <div className="bg-zinc-900/60 border border-zinc-800 p-6 rounded-2xl space-y-4">
-                <div className="flex justify-between items-center text-xs border-b border-zinc-800 pb-3">
-                  <span className="text-zinc-400 flex items-center gap-1.5"><Wallet className="w-3.5 h-3.5" /> Total Gross Generated</span>
-                  <span className="font-bold text-zinc-200">${transactions.reduce((acc, t) => acc + t.grossAmount, 0).toFixed(2)}</span>
-                </div>
-                <div className="flex justify-between items-center text-xs">
-                  <span className="text-zinc-400 flex items-center gap-1.5"><Percent className="w-3.5 h-3.5" /> Total Paid to House Split</span>
-                  <span className="font-bold text-zinc-400">${transactions.reduce((acc, t) => acc + (t.grossAmount - t.netAmount), 0).toFixed(2)}</span>
-                </div>
-              </div>
-            </div>
+        <main className="max-w-7xl mx-auto px-6 py-10 space-y-10">
 
-            {/* Data Portability Box */}
-            <div>
-              <h3 className="text-sm font-bold uppercase tracking-widest text-zinc-500 mb-3">Data Operations</h3>
-              <div className="bg-zinc-900/40 border border-zinc-900 p-5 rounded-2xl space-y-3">
-                <p className="text-xs text-zinc-400 leading-relaxed">
-                  Export encryption matrix instances locally or populate your running ledger via an existing session backup file.
-                </p>
-                <div className="grid grid-cols-2 gap-3">
-                  <button 
-                    onClick={handleExportData}
-                    className="flex items-center justify-center gap-2 bg-zinc-900 hover:bg-zinc-800 border border-zinc-800 text-zinc-300 font-bold py-2.5 rounded-xl text-xs transition-colors"
+          {/* Metric ticket strip */}
+          <section>
+            <h2 className="font-mono-ledger text-[11px] font-semibold uppercase tracking-[0.15em] text-[#C39A48] mb-4">
+              Earnings Rollup — Take-Home Net
+            </h2>
+            <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-7 gap-3">
+              {[
+                { label: 'Hour', val: metrics.hr },
+                { label: 'Today', val: metrics.day, highlight: true },
+                { label: 'Week', val: metrics.wk },
+                { label: 'Bi-Weekly', val: metrics.biWk },
+                { label: 'Month', val: metrics.mo },
+                { label: '3 Months', val: metrics.triMo },
+                { label: 'Yearly Est.', val: metrics.yr },
+              ].map((card, idx) => (
+                <div
+                  key={idx}
+                  className={`p-4 rounded-sm border ${
+                    card.highlight
+                      ? 'bg-[#EFE7D8] border-[#A83A2C] shadow-lg'
+                      : 'bg-[#EFE7D8]/95 border-[#EFE7D8]/20'
+                  }`}
+                >
+                  <span className="font-mono-ledger text-[10px] uppercase tracking-wide text-[#16130F]/50 block mb-1">
+                    {card.label}
+                  </span>
+                  <span
+                    className={`font-mono-ledger text-lg font-bold tracking-tight ${
+                      card.highlight ? 'text-[#A83A2C]' : 'text-[#16130F]'
+                    }`}
                   >
-                    <Download className="w-3.5 h-3.5 text-emerald-400" /> Export JSON
-                  </button>
-                  <button 
-                    onClick={() => fileInputRef.current?.click()}
-                    className="flex items-center justify-center gap-2 bg-zinc-900 hover:bg-zinc-800 border border-zinc-800 text-zinc-300 font-bold py-2.5 rounded-xl text-xs transition-colors"
-                  >
-                    <Upload className="w-3.5 h-3.5 text-emerald-400" /> Upload File
-                  </button>
+                    ${money(card.val)}
+                  </span>
                 </div>
-                <input 
-                  type="file" 
-                  ref={fileInputRef} 
-                  onChange={handleImportData} 
-                  accept=".json" 
-                  className="hidden" 
-                />
+              ))}
+            </div>
+          </section>
+
+          <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
+
+            {/* Session feed */}
+            <div className="lg:col-span-2 space-y-4">
+              <h3 className="font-mono-ledger text-[11px] font-semibold uppercase tracking-[0.15em] text-[#C39A48]">
+                Session Feed
+              </h3>
+              <div className="bg-[#EFE7D8] text-[#16130F] rounded-sm overflow-hidden shadow-lg">
+                {isLoading ? (
+                  <div className="p-12 text-center text-[#16130F]/50 text-sm flex flex-col items-center justify-center gap-3">
+                    <RefreshCw className="w-5 h-5 animate-spin text-[#A83A2C]" />
+                    <span className="font-mono-ledger text-xs">Syncing ledger…</span>
+                  </div>
+                ) : transactions.length === 0 ? (
+                  <div className="p-10 text-center text-[#16130F]/50 text-sm">
+                    No sessions logged yet. Tap{' '}
+                    <span className="font-semibold text-[#A83A2C]">Log Session</span> to start
+                    your ledger.
+                  </div>
+                ) : (
+                  <div className="divide-y divide-dashed divide-[#16130F]/15">
+                    {transactions.map((t) => (
+                      <div
+                        key={t.id}
+                        className="p-5 flex items-center justify-between hover:bg-[#16130F]/[0.03] transition-colors"
+                      >
+                        <div className="space-y-1.5 min-w-0">
+                          <div className="flex items-center gap-2 flex-wrap">
+                            <span className="font-bold text-sm">{t.clientName}</span>
+                            <span
+                              className={`text-[10px] px-2 py-0.5 rounded-full border font-mono-ledger font-semibold uppercase tracking-wide ${INCOME_TAG_STYLES[t.incomeType]}`}
+                            >
+                              {t.incomeType}
+                            </span>
+                          </div>
+
+                          <div className="flex items-center gap-2 flex-wrap">
+                            <p className="text-xs text-[#16130F]/55 truncate max-w-[220px]">
+                              {t.description || 'No job context provided'}
+                            </p>
+                            <span className="text-[10px] bg-[#16130F] text-[#EFE7D8] px-2 py-0.5 rounded font-mono-ledger font-semibold uppercase tracking-wide">
+                              {t.paymentMethod === 'ath-movil' ? 'ATH Móvil' : t.paymentMethod}
+                            </span>
+                          </div>
+
+                          <p className="text-[10px] text-[#16130F]/40 font-mono-ledger">
+                            {new Date(t.timestamp).toLocaleTimeString()}
+                          </p>
+                        </div>
+                        <div className="text-right shrink-0 pl-4">
+                          <span className="font-mono-ledger text-sm font-bold text-[#2F544A] block">
+                            +${money(t.netAmount)}
+                          </span>
+                          {t.shopCutPercentage > 0 && (
+                            <span className="text-[10px] text-[#16130F]/40 block font-mono-ledger">
+                              Gross ${t.grossAmount} (&minus;{t.shopCutPercentage}%)
+                            </span>
+                          )}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
               </div>
             </div>
 
-          </div>
-
-        </div>
-      </main>
-
-      {/* Log Form Modal Component */}
-      {isModalOpen && (
-        <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex justify-center items-end sm:items-center p-4">
-          <div className="bg-zinc-900 border border-zinc-800 w-full max-w-lg rounded-t-2xl sm:rounded-2xl p-6 space-y-5 shadow-2xl max-h-[90vh] overflow-y-auto">
-            <div className="flex justify-between items-center">
-              <h3 className="text-lg font-black tracking-tight">Record New Session Revenue</h3>
-              <button onClick={() => setIsModalOpen(false)} className="text-zinc-500 text-xs hover:text-zinc-300 font-bold uppercase">Cancel</button>
-            </div>
-
-            <form onSubmit={handleLogIncome} className="space-y-4">
+            {/* Sidebar */}
+            <div className="space-y-6">
               <div>
-                <label className="block text-xs font-bold text-zinc-400 uppercase tracking-wider mb-2">Gross Amount Collected ($)</label>
-                <div className="relative">
-                  <DollarSign className="absolute left-4 top-3.5 h-5 w-5 text-emerald-400" />
-                  <input 
-                    type="text" 
-                    inputMode="decimal"
-                    pattern="[0-9]*[.,]?[0-9]*"
-                    required 
-                    value={grossAmount} 
-                    onChange={e => {
-                      // Filter out anything that isn't a digit or a period decimal point
-                      const sanitized = e.target.value.replace(/[^0-9.]/g, '');
-                      setGrossAmount(sanitized);
-                    }} 
-                    placeholder="0.00" 
-                    className="w-full bg-zinc-950 border border-zinc-800 rounded-xl py-3.5 pl-12 pr-4 text-lg focus:outline-none focus:border-emerald-500 text-zinc-100 font-bold" 
+                <h3 className="font-mono-ledger text-[11px] font-semibold uppercase tracking-[0.15em] text-[#C39A48] mb-3">
+                  Shop Efficiency
+                </h3>
+                <div className="bg-[#EFE7D8] text-[#16130F] p-6 rounded-sm shadow-lg space-y-4">
+                  <div className="flex justify-between items-center text-xs border-b border-dashed border-[#16130F]/15 pb-3">
+                    <span className="text-[#16130F]/60 flex items-center gap-1.5">
+                      <Wallet className="w-3.5 h-3.5" /> Total gross generated
+                    </span>
+                    <span className="font-mono-ledger font-bold">
+                      ${money(transactions.reduce((acc, t) => acc + t.grossAmount, 0))}
+                    </span>
+                  </div>
+                  <div className="flex justify-between items-center text-xs">
+                    <span className="text-[#16130F]/60 flex items-center gap-1.5">
+                      <Percent className="w-3.5 h-3.5" /> Total paid to shop split
+                    </span>
+                    <span className="font-mono-ledger font-bold text-[#A83A2C]">
+                      ${money(transactions.reduce((acc, t) => acc + (t.grossAmount - t.netAmount), 0))}
+                    </span>
+                  </div>
+                </div>
+              </div>
+
+              <div>
+                <h3 className="font-mono-ledger text-[11px] font-semibold uppercase tracking-[0.15em] text-[#C39A48] mb-3">
+                  Data Operations
+                </h3>
+                <div className="bg-[#EFE7D8] text-[#16130F] p-5 rounded-sm shadow-lg space-y-3">
+                  <p className="text-xs text-[#16130F]/60 leading-relaxed">
+                    Export a backup of your ledger, or restore from a previous backup file.
+                  </p>
+                  <div className="grid grid-cols-2 gap-3">
+                    <button
+                      onClick={handleExportData}
+                      className="flex items-center justify-center gap-2 border border-[#16130F]/15 hover:border-[#16130F]/30 text-[#16130F] font-semibold py-2.5 rounded-sm text-xs transition-colors focus-visible:outline focus-visible:outline-2 focus-visible:outline-[#A83A2C]"
+                    >
+                      <Download className="w-3.5 h-3.5 text-[#2F544A]" /> Export
+                    </button>
+                    <button
+                      onClick={() => fileInputRef.current?.click()}
+                      className="flex items-center justify-center gap-2 border border-[#16130F]/15 hover:border-[#16130F]/30 text-[#16130F] font-semibold py-2.5 rounded-sm text-xs transition-colors focus-visible:outline focus-visible:outline-2 focus-visible:outline-[#A83A2C]"
+                    >
+                      <Upload className="w-3.5 h-3.5 text-[#2F544A]" /> Import
+                    </button>
+                  </div>
+                  <input
+                    type="file"
+                    ref={fileInputRef}
+                    onChange={handleImportData}
+                    accept=".json"
+                    className="hidden"
                   />
                 </div>
               </div>
-
-              <div className="grid grid-cols-2 gap-3">
-                <div>
-                  <label className="block text-xs font-bold text-zinc-400 uppercase tracking-wider mb-2">Category</label>
-                  <select value={incomeType} onChange={e => setIncomeType(e.target.value as IncomeType)} className="w-full bg-zinc-950 border border-zinc-800 rounded-xl p-3 text-sm text-zinc-300 focus:outline-none focus:border-emerald-500">
-                    <option value="appointment">Appointment</option>
-                    <option value="walk-in">Walk-In</option>
-                    <option value="deposit">Deposit Only</option>
-                    <option value="tip">Direct Tip</option>
-                  </select>
-                </div>
-                <div>
-                  <label className="block text-xs font-bold text-zinc-400 uppercase tracking-wider mb-2">Channel</label>
-                  <select value={paymentMethod} onChange={e => setPaymentMethod(e.target.value as PaymentMethod)} className="w-full bg-zinc-950 border border-zinc-800 rounded-xl p-3 text-sm text-zinc-300 focus:outline-none focus:border-emerald-500">
-                    <option value="cash">💵 Cash (Efectivo)</option>
-                    <option value="ath-movil">📱 ATH Móvil</option>
-                    <option value="card">💳 Card Terminal (Datáfono)</option>
-                    <option value="zelle">📱 Zelle</option>
-                    <option value="venmo">📱 Venmo</option>
-                    <option value="paypal">📱 PayPal</option>
-                  </select>
-                </div>
-              </div>
-
-              <div className="grid grid-cols-3 gap-3 items-center">
-                <div className="col-span-2">
-                  <label className="block text-xs font-bold text-zinc-400 uppercase tracking-wider mb-2">Client Identity</label>
-                  <input type="text" value={clientName} onChange={e => setClientName(e.target.value)} placeholder="Marcus M." className="w-full bg-zinc-950 border border-zinc-800 rounded-xl p-3 text-sm text-zinc-100 focus:outline-none focus:border-emerald-500" />
-                </div>
-                <div>
-                  <label className="block text-xs font-bold text-zinc-400 uppercase tracking-wider mb-2">Shop Cut %</label>
-                  <input type="number" step="any" value={shopCut} onChange={e => setShopCut(e.target.value)} placeholder="40" className="w-full bg-zinc-950 border border-zinc-800 rounded-xl p-3 text-sm text-zinc-100 focus:outline-none focus:border-emerald-500 font-mono" />
-                </div>
-              </div>
-
-              <div>
-                <label className="block text-xs font-bold text-zinc-400 uppercase tracking-wider mb-2">Session Notes / Placement Description</label>
-                <textarea value={description} onChange={e => setDescription(e.target.value)} placeholder="e.g. Linework completed, shading scheduled next month." rows={2} className="w-full bg-zinc-950 border border-zinc-800 rounded-xl p-3 text-sm text-zinc-100 focus:outline-none focus:border-emerald-500" />
-              </div>
-
-              <button type="submit" className="w-full bg-emerald-500 hover:bg-emerald-600 text-zinc-950 font-black py-4 rounded-xl text-md transition-all shadow-lg">Commit Session Entry</button>
-            </form>
+            </div>
           </div>
-        </div>
-      )}
+        </main>
 
+        {/* Log session modal */}
+        {isModalOpen && (
+          <div className="fixed inset-0 z-50 bg-[#16130F]/85 backdrop-blur-sm flex justify-center items-end sm:items-center p-4">
+            <div className="bg-[#EFE7D8] text-[#16130F] w-full max-w-lg rounded-t-sm sm:rounded-sm p-6 space-y-5 shadow-2xl max-h-[90vh] overflow-y-auto">
+              <div className="flex justify-between items-center border-b border-dashed border-[#16130F]/15 pb-4">
+                <div>
+                  <p className="font-mono-ledger text-[10px] uppercase tracking-[0.2em] text-[#16130F]/40 mb-1">
+                    New Entry
+                  </p>
+                  <h3 className="font-display text-2xl">Session Ticket</h3>
+                </div>
+                <button
+                  onClick={() => setIsModalOpen(false)}
+                  className="text-[#16130F]/40 hover:text-[#16130F] p-1 rounded focus-visible:outline focus-visible:outline-2 focus-visible:outline-[#A83A2C]"
+                  aria-label="Close"
+                >
+                  <X className="w-5 h-5" />
+                </button>
+              </div>
+
+              <form onSubmit={handleLogIncome} className="space-y-4">
+                <div>
+                  <label className="block text-[11px] font-mono-ledger font-semibold text-[#16130F]/50 uppercase tracking-wider mb-2">
+                    Gross Amount Collected
+                  </label>
+                  <div className="relative">
+                    <DollarSign className="absolute left-4 top-3.5 h-5 w-5 text-[#A83A2C]" />
+                    <input
+                      type="text"
+                      inputMode="decimal"
+                      pattern="[0-9]*[.,]?[0-9]*"
+                      required
+                      value={grossAmount}
+                      onChange={e => {
+                        const sanitized = e.target.value.replace(/[^0-9.]/g, '');
+                        setGrossAmount(sanitized);
+                      }}
+                      placeholder="0.00"
+                      className="w-full bg-white border border-[#16130F]/15 rounded-sm py-3.5 pl-12 pr-4 text-lg font-mono-ledger font-bold focus:outline-none focus:border-[#A83A2C] text-[#16130F]"
+                    />
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-2 gap-3">
+                  <div>
+                    <label className="block text-[11px] font-mono-ledger font-semibold text-[#16130F]/50 uppercase tracking-wider mb-2">
+                      Category
+                    </label>
+                    <select
+                      value={incomeType}
+                      onChange={e => setIncomeType(e.target.value as IncomeType)}
+                      className="w-full bg-white border border-[#16130F]/15 rounded-sm p-3 text-sm text-[#16130F] focus:outline-none focus:border-[#A83A2C]"
+                    >
+                      <option value="appointment">Appointment</option>
+                      <option value="walk-in">Walk-In</option>
+                      <option value="deposit">Deposit Only</option>
+                      <option value="tip">Direct Tip</option>
+                    </select>
+                  </div>
+                  <div>
+                    <label className="block text-[11px] font-mono-ledger font-semibold text-[#16130F]/50 uppercase tracking-wider mb-2">
+                      Channel
+                    </label>
+                    <select
+                      value={paymentMethod}
+                      onChange={e => setPaymentMethod(e.target.value as PaymentMethod)}
+                      className="w-full bg-white border border-[#16130F]/15 rounded-sm p-3 text-sm text-[#16130F] focus:outline-none focus:border-[#A83A2C]"
+                    >
+                      <option value="cash">Cash (Efectivo)</option>
+                      <option value="ath-movil">ATH Móvil</option>
+                      <option value="card">Card (Datáfono)</option>
+                      <option value="zelle">Zelle</option>
+                      <option value="venmo">Venmo</option>
+                      <option value="paypal">PayPal</option>
+                    </select>
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-3 gap-3 items-start">
+                  <div className="col-span-2">
+                    <label className="block text-[11px] font-mono-ledger font-semibold text-[#16130F]/50 uppercase tracking-wider mb-2">
+                      Client
+                    </label>
+                    <input
+                      type="text"
+                      value={clientName}
+                      onChange={e => setClientName(e.target.value)}
+                      placeholder="Marcus M."
+                      className="w-full bg-white border border-[#16130F]/15 rounded-sm p-3 text-sm text-[#16130F] focus:outline-none focus:border-[#A83A2C]"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-[11px] font-mono-ledger font-semibold text-[#16130F]/50 uppercase tracking-wider mb-2">
+                      Shop Cut %
+                    </label>
+                    <input
+                      type="number"
+                      step="any"
+                      value={shopCut}
+                      onChange={e => setShopCut(e.target.value)}
+                      placeholder="40"
+                      className="w-full bg-white border border-[#16130F]/15 rounded-sm p-3 text-sm text-[#16130F] focus:outline-none focus:border-[#A83A2C] font-mono-ledger"
+                    />
+                  </div>
+                </div>
+
+                <div>
+                  <label className="block text-[11px] font-mono-ledger font-semibold text-[#16130F]/50 uppercase tracking-wider mb-2">
+                    Session Notes
+                  </label>
+                  <textarea
+                    value={description}
+                    onChange={e => setDescription(e.target.value)}
+                    placeholder="e.g. Linework completed, shading scheduled next month."
+                    rows={2}
+                    className="w-full bg-white border border-[#16130F]/15 rounded-sm p-3 text-sm text-[#16130F] focus:outline-none focus:border-[#A83A2C]"
+                  />
+                </div>
+
+                <button
+                  type="submit"
+                  disabled={isSubmitting}
+                  className="w-full bg-[#A83A2C] hover:bg-[#c04430] disabled:bg-[#16130F]/20 disabled:text-[#16130F]/40 text-[#EFE7D8] font-bold py-4 rounded-sm text-sm transition-colors shadow-lg active:scale-[0.98] flex items-center justify-center gap-2 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#16130F]"
+                >
+                  {isSubmitting ? (
+                    <>
+                      <RefreshCw className="w-4 h-4 animate-spin" /> Stamping entry…
+                    </>
+                  ) : (
+                    'Commit Session Entry'
+                  )}
+                </button>
+              </form>
+            </div>
+          </div>
+        )}
+      </div>
     </div>
   );
 }

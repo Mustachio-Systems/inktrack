@@ -493,7 +493,7 @@ export default {
 
     const corsHeaders = {
       'Access-Control-Allow-Origin': '*',
-      'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+      'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
       'Access-Control-Allow-Headers': 'Content-Type, Authorization',
     };
 
@@ -761,6 +761,82 @@ export default {
           .run();
 
         return respond({ success: true, id: transaction.id, netAmount }, 201);
+      }
+
+
+      // PUT /api/transactions/:id
+      // The artist ID is included in every write condition so an authenticated
+      // artist can only modify their own ledger entries.
+      const transactionRoute = url.pathname.match(/^\/api\/transactions\/([^/]+)$/);
+
+      if (transactionRoute && request.method === 'PUT') {
+        const transactionId = decodeURIComponent(transactionRoute[1]);
+        const body = await parseJsonBody(request);
+
+        if (!body) return respond({ error: 'Invalid request body.' }, 400);
+
+        const validated = validateTransactionPayload(body);
+        if (!validated.ok) {
+          return respond({ error: validated.error }, 400);
+        }
+
+        const transaction = validated.value;
+
+        if (transaction.id !== transactionId) {
+          return respond({ error: 'Transaction ID does not match the requested record.' }, 400);
+        }
+
+        const netAmount =
+          Math.round(
+            transaction.grossAmount * (1 - transaction.shopCutPercentage / 100) * 100,
+          ) / 100;
+
+        const result = await env.DB
+          .prepare(
+            `UPDATE transactions
+             SET clientName = ?,
+                 description = ?,
+                 incomeType = ?,
+                 paymentMethod = ?,
+                 grossAmount = ?,
+                 shopCutPercentage = ?,
+                 netAmount = ?
+             WHERE id = ? AND artist_id = ?`,
+          )
+          .bind(
+            transaction.clientName,
+            transaction.description,
+            transaction.incomeType,
+            transaction.paymentMethod,
+            transaction.grossAmount,
+            transaction.shopCutPercentage,
+            netAmount,
+            transactionId,
+            session.artistId,
+          )
+          .run();
+
+        if (!result.meta.changes) {
+          return respond({ error: 'Session not found.' }, 404);
+        }
+
+        return respond({ success: true, id: transactionId, netAmount });
+      }
+
+      // DELETE /api/transactions/:id
+      if (transactionRoute && request.method === 'DELETE') {
+        const transactionId = decodeURIComponent(transactionRoute[1]);
+
+        const result = await env.DB
+          .prepare('DELETE FROM transactions WHERE id = ? AND artist_id = ?')
+          .bind(transactionId, session.artistId)
+          .run();
+
+        if (!result.meta.changes) {
+          return respond({ error: 'Session not found.' }, 404);
+        }
+
+        return respond({ success: true, id: transactionId });
       }
 
       return respond({ error: 'Not found.' }, 404);

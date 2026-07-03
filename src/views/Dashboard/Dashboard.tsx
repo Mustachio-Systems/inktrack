@@ -19,6 +19,8 @@ import {
   TrendingUp,
   Upload,
   Users,
+  Pencil,
+  Trash2,
   Wallet,
   X,
 } from 'lucide-react';
@@ -164,6 +166,7 @@ export default function Dashboard({ setAuth }: DashboardProps) {
   const [clientName, setClientName] = useState('');
   const [shopCut, setShopCut] = useState('40');
   const [description, setDescription] = useState('');
+  const [editingTransaction, setEditingTransaction] = useState<Transaction | null>(null);
 
   const triggerStatus = (type: StatusMessage['type'], text: string) => {
     setStatusMessage({ type, text });
@@ -388,6 +391,38 @@ export default function Dashboard({ setAuth }: DashboardProps) {
     }
   };
 
+  const clearTransactionForm = () => {
+    setGrossAmount('');
+    setIncomeType('appointment');
+    setPaymentMethod('cash');
+    setClientName('');
+    setShopCut('40');
+    setDescription('');
+    setEditingTransaction(null);
+  };
+
+  const openNewSession = () => {
+    clearTransactionForm();
+    setIsModalOpen(true);
+  };
+
+  const openEditSession = (transaction: Transaction) => {
+    setEditingTransaction(transaction);
+    setGrossAmount(String(transaction.grossAmount));
+    setIncomeType(transaction.incomeType);
+    setPaymentMethod(transaction.paymentMethod);
+    setClientName(transaction.clientName ?? '');
+    setShopCut(String(transaction.shopCutPercentage));
+    setDescription(transaction.description ?? '');
+    setIsModalOpen(true);
+  };
+
+  const closeTransactionModal = () => {
+    if (isSubmitting) return;
+    setIsModalOpen(false);
+    clearTransactionForm();
+  };
+
   const handleLogIncome = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     if (isSubmitting) return;
@@ -405,9 +440,10 @@ export default function Dashboard({ setAuth }: DashboardProps) {
       return;
     }
 
-    const newTransaction: Transaction = {
-      id: crypto.randomUUID(),
-      timestamp: new Date().toISOString(),
+    const isEditing = editingTransaction !== null;
+    const transaction: Transaction = {
+      id: editingTransaction?.id ?? crypto.randomUUID(),
+      timestamp: editingTransaction?.timestamp ?? new Date().toISOString(),
       clientName: clientName.trim() || 'Anonymous Client',
       description: description.trim(),
       incomeType,
@@ -418,34 +454,87 @@ export default function Dashboard({ setAuth }: DashboardProps) {
     };
 
     const previousTransactions = [...transactions];
-    setIsSubmitting(true);
-    setTransactions([newTransaction, ...transactions]);
-    setSelectedMonth(startOfMonth(new Date()));
-    setSelectedWeekStart(startOfWeek(new Date()));
-    setSelectedDay(localDayStart(new Date()));
-    setIsModalOpen(false);
+    const nextTransactions = isEditing
+      ? transactions.map((item) => (item.id === transaction.id ? transaction : item))
+      : [transaction, ...transactions];
 
-    setGrossAmount('');
-    setClientName('');
-    setDescription('');
+    setIsSubmitting(true);
+    setTransactions(nextTransactions);
+    setIsModalOpen(false);
+    clearTransactionForm();
 
     try {
-      const response = await authFetch(API_URL, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(newTransaction),
-      });
+      const response = await authFetch(
+        isEditing ? `${API_URL}/${encodeURIComponent(transaction.id)}` : API_URL,
+        {
+          method: isEditing ? 'PUT' : 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(transaction),
+        },
+      );
 
-      if (!response.ok) throw new Error('D1 write failure');
+      const payload = (await response.json().catch(() => ({}))) as { error?: string; netAmount?: number };
 
-      localStorage.setItem('inktrack_ledger', JSON.stringify([newTransaction, ...previousTransactions]));
-      triggerStatus('success', 'Session added to this week’s ledger.');
+      if (!response.ok) {
+        throw new Error(payload.error || (isEditing ? 'Could not update the session.' : 'Could not create the session.'));
+      }
+
+      const serverTransaction: Transaction = {
+        ...transaction,
+        netAmount: typeof payload.netAmount === 'number' ? payload.netAmount : transaction.netAmount,
+      };
+
+      const savedTransactions = isEditing
+        ? previousTransactions.map((item) => (item.id === serverTransaction.id ? serverTransaction : item))
+        : [serverTransaction, ...previousTransactions];
+
+      setTransactions(savedTransactions);
+      localStorage.setItem('inktrack_ledger', JSON.stringify(savedTransactions));
+      triggerStatus('success', isEditing ? 'Session updated.' : 'Session added to this week’s ledger.');
     } catch (error) {
       console.error(error);
       setTransactions(previousTransactions);
-      triggerStatus('error', 'Write failed — entry was rolled back.');
+      triggerStatus(
+        'error',
+        error instanceof Error ? error.message : 'Save failed — the change was rolled back.',
+      );
     } finally {
       setIsSubmitting(false);
+    }
+  };
+
+  const handleDeleteSession = async (transaction: Transaction) => {
+    const client = transaction.clientName?.trim() || 'this session';
+
+    if (!window.confirm(`Delete ${client}? This cannot be undone.`)) {
+      return;
+    }
+
+    const previousTransactions = [...transactions];
+    const nextTransactions = transactions.filter((item) => item.id !== transaction.id);
+
+    setTransactions(nextTransactions);
+
+    try {
+      const response = await authFetch(`${API_URL}/${encodeURIComponent(transaction.id)}`, {
+        method: 'DELETE',
+      });
+
+      const payload = (await response.json().catch(() => ({}))) as { error?: string };
+
+      if (!response.ok) {
+        throw new Error(payload.error || 'Could not delete the session.');
+      }
+
+      localStorage.setItem('inktrack_ledger', JSON.stringify(nextTransactions));
+      triggerStatus('success', 'Session deleted.');
+    } catch (error) {
+      console.error(error);
+      setTransactions(previousTransactions);
+      triggerStatus(
+        'error',
+        error instanceof Error ? error.message : 'Delete failed — the session was restored.',
+      );
     }
   };
 
@@ -558,7 +647,7 @@ export default function Dashboard({ setAuth }: DashboardProps) {
               <RefreshCw className={`h-4 w-4 ${isLoading ? 'animate-spin text-[#C39A48]' : ''}`} />
             </button>
             <button
-              onClick={() => setIsModalOpen(true)}
+              onClick={openNewSession}
               className="flex items-center gap-2 rounded-md bg-[#A83A2C] px-3 py-2.5 text-sm font-bold text-[#EFE7D8] shadow-md transition-colors hover:bg-[#c04430] active:scale-[0.97] focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#C39A48] sm:px-4"
             >
               <Plus className="h-4 w-4 stroke-[3]" />
@@ -938,13 +1027,34 @@ export default function Dashboard({ setAuth }: DashboardProps) {
                             {new Date(transaction.timestamp).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}
                           </p>
                         </div>
-                        <div className="shrink-0 text-right">
-                          <p className="font-mono-ledger text-sm font-bold text-[#2F544A]">
-                            +{formatCurrency(transaction.netAmount)}
-                          </p>
-                          <p className="mt-1 font-mono-ledger text-[10px] text-[#16130F]/40">
-                            Gross {formatCurrency(transaction.grossAmount)} · −{transaction.shopCutPercentage}%
-                          </p>
+                        <div className="flex shrink-0 items-center gap-2">
+                          <div className="text-right">
+                            <p className="font-mono-ledger text-sm font-bold text-[#2F544A]">
+                              +{formatCurrency(transaction.netAmount)}
+                            </p>
+                            <p className="mt-1 font-mono-ledger text-[10px] text-[#16130F]/40">
+                              Gross {formatCurrency(transaction.grossAmount)} · −{transaction.shopCutPercentage}%
+                            </p>
+                          </div>
+
+                          <div className="flex flex-col gap-1 border-l border-[#16130F]/10 pl-2">
+                            <button
+                              type="button"
+                              onClick={() => openEditSession(transaction)}
+                              title="Edit session"
+                              className="rounded p-1.5 text-[#16130F]/45 transition-colors hover:bg-[#C39A48]/15 hover:text-[#8A6A2F] focus-visible:outline focus-visible:outline-2 focus-visible:outline-[#A83A2C]"
+                            >
+                              <Pencil className="h-3.5 w-3.5" />
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => handleDeleteSession(transaction)}
+                              title="Delete session"
+                              className="rounded p-1.5 text-[#16130F]/45 transition-colors hover:bg-[#A83A2C]/10 hover:text-[#A83A2C] focus-visible:outline focus-visible:outline-2 focus-visible:outline-[#A83A2C]"
+                            >
+                              <Trash2 className="h-3.5 w-3.5" />
+                            </button>
+                          </div>
                         </div>
                       </div>
                     ))}
@@ -1037,12 +1147,14 @@ export default function Dashboard({ setAuth }: DashboardProps) {
               <div className="flex items-center justify-between border-b border-dashed border-[#16130F]/15 pb-4">
                 <div>
                   <p className="mb-1 font-mono-ledger text-[10px] uppercase tracking-[0.2em] text-[#16130F]/40">
-                    New Entry
+                    {editingTransaction ? 'Edit Entry' : 'New Entry'}
                   </p>
-                  <h2 className="font-display text-2xl">Session Ticket</h2>
+                  <h2 className="font-display text-2xl">
+                    {editingTransaction ? 'Update Session' : 'Session Ticket'}
+                  </h2>
                 </div>
                 <button
-                  onClick={() => setIsModalOpen(false)}
+                  onClick={closeTransactionModal}
                   className="rounded p-1 text-[#16130F]/40 transition-colors hover:text-[#16130F] focus-visible:outline focus-visible:outline-2 focus-visible:outline-[#A83A2C]"
                   aria-label="Close"
                 >
@@ -1158,10 +1270,11 @@ export default function Dashboard({ setAuth }: DashboardProps) {
                 >
                   {isSubmitting ? (
                     <>
-                      <RefreshCw className="h-4 w-4 animate-spin" /> Stamping entry…
+                      <RefreshCw className="h-4 w-4 animate-spin" />
+                      {editingTransaction ? 'Saving changes…' : 'Stamping entry…'}
                     </>
                   ) : (
-                    'Commit Session Entry'
+                    editingTransaction ? 'Save Session Changes' : 'Commit Session Entry'
                   )}
                 </button>
               </form>

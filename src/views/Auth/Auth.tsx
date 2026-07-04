@@ -113,9 +113,9 @@ export default function Auth({ setAuth, mode: initialMode }: AuthProps) {
           throw new Error(data.error || 'Could not create your account.');
         }
 
-        setSuccessMessage("Ledger opened. Sign in to reach your dashboard.");
-        switchTo('login');
+        setViewMode('login');
         setPassword('');
+        setSuccessMessage('Ledger opened. Sign in to reach your dashboard.');
       }
 
       // ---------------------------------------------------------

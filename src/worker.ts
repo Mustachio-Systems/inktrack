@@ -319,22 +319,61 @@ function validateExpense(value: JsonObject): { ok: true; data: ShopExpenseInput 
   };
 }
 
-async function sendEmail(env: Env, to: string, subject: string, html: string): Promise<void> {
-  if (!env.RESEND_API_KEY || !env.EMAIL_FROM || !env.APP_URL) throw new Error('Email configuration is incomplete.');
+async function sendEmail(
+    env: Env,
+    to: string,
+    subject: string,
+    html: string,
+) {
+    if (!env.RESEND_API_KEY) {
+        throw new Error('RESEND_API_KEY is missing in the Worker environment.');
+    }
 
-  const response = await fetch('https://api.resend.com/emails', {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${env.RESEND_API_KEY}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({ from: env.EMAIL_FROM, to: [to], subject, html }),
-  });
+    if (!env.EMAIL_FROM) {
+        throw new Error('EMAIL_FROM is missing in the Worker environment.');
+    }
 
-  if (!response.ok) {
-    console.error('Resend failed:', response.status, await response.text());
-    throw new Error('Email delivery failed.');
-  }
+    if (!env.APP_URL) {
+        throw new Error('APP_URL is missing in the Worker environment.');
+    }
+
+    const response = await fetch('https://api.resend.com/emails', {
+        method: 'POST',
+        headers: {
+            Authorization: `Bearer ${env.RESEND_API_KEY}`,
+            'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+            from: env.EMAIL_FROM,
+            to: [to],
+            subject,
+            html,
+        }),
+    });
+
+    const responseText = await response.text();
+
+    if (!response.ok) {
+        console.error('Resend failed:', {
+            status: response.status,
+            statusText: response.statusText,
+            response: responseText,
+            to,
+            from: env.EMAIL_FROM,
+        });
+
+        throw new Error(
+            `Resend rejected the email (${response.status}): ${responseText}`,
+        );
+    }
+
+    console.log('Resend accepted email:', {
+        to,
+        subject,
+        response: responseText,
+    });
+
+    return responseText;
 }
 
 export default {
@@ -374,18 +413,43 @@ export default {
           .bind(artistId, normalizedEmail, await CryptoUtils.hashPassword(password), artistName.trim())
           .run();
 
+        let welcomeEmailSent = false;
+        let welcomeEmailError: string | null = null;
+
         try {
-          await sendEmail(
-            env,
-            normalizedEmail,
-            'Welcome to InkTrack',
-            `<div style="font-family:Arial,sans-serif"><h1>Welcome to InkTrack, ${artistName.trim()}.</h1><p>Your artist ledger is ready.</p><p><a href="${new URL('/login', env.APP_URL)}">Open InkTrack</a></p></div>`,
-          );
+            await sendEmail(
+                env,
+                normalizedEmail,
+                'Welcome to InkTrack',
+                `<div style="font-family:Arial,sans-serif">
+                  <h1>Welcome to InkTrack, ${artistName.trim()}.</h1>
+                  <p>Your artist ledger is ready.</p>
+                  <p>
+                    <a href="${new URL('/login', env.APP_URL)}">
+                      Open InkTrack
+                    </a>
+                  </p>
+                </div>`,
+            );
+
+            welcomeEmailSent = true;
         } catch (error) {
-          console.error('Welcome email error:', error);
+            console.error('Welcome email error:', error);
+
+            welcomeEmailError =
+                error instanceof Error
+                    ? error.message
+                    : 'Unknown welcome-email error.';
         }
 
-        return respond({ success: true }, 201);
+        return respond(
+            {
+                success: true,
+                welcomeEmailSent,
+                welcomeEmailError,
+            },
+            201,
+        );
       }
 
       if (url.pathname === '/api/auth/login' && request.method === 'POST') {

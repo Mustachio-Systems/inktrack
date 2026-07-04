@@ -1,114 +1,9 @@
 /// <reference types="@cloudflare/workers-types" />
-// ---------------------------------------------------------------------------
-// CONSTANTS
-// ---------------------------------------------------------------------------
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const INCOME_TYPES = new Set(['appointment', 'walk-in', 'deposit', 'tip']);
 const PAYMENT_METHODS = new Set(['cash', 'card', 'ath-movil', 'zelle', 'venmo', 'paypal']);
-const RESET_TOKEN_TTL_MS = 60 * 60 * 1000; // 1 hour
-const SESSION_TTL_SECONDS = 60 * 60 * 24; // 24 hours
-// ---------------------------------------------------------------------------
-// NATIVE WEB CRYPTO UTILITIES
-// ---------------------------------------------------------------------------
-const CryptoUtils = {
-    uuidv4() {
-        return crypto.randomUUID();
-    },
-    generateResetToken() {
-        const bytes = crypto.getRandomValues(new Uint8Array(32));
-        return Array.from(bytes)
-            .map((byte) => byte.toString(16).padStart(2, '0'))
-            .join('');
-    },
-    async hashPassword(password) {
-        const salt = crypto.getRandomValues(new Uint8Array(16));
-        const baseKey = await crypto.subtle.importKey('raw', new TextEncoder().encode(password), 'PBKDF2', false, ['deriveBits']);
-        const bits = await crypto.subtle.deriveBits({
-            name: 'PBKDF2',
-            salt,
-            iterations: 100000,
-            hash: 'SHA-256',
-        }, baseKey, 256);
-        const saltHex = Array.from(salt)
-            .map((byte) => byte.toString(16).padStart(2, '0'))
-            .join('');
-        const hashHex = Array.from(new Uint8Array(bits))
-            .map((byte) => byte.toString(16).padStart(2, '0'))
-            .join('');
-        return `${saltHex}:${hashHex}`;
-    },
-    timingSafeEqual(a, b) {
-        if (a.length !== b.length)
-            return false;
-        let result = 0;
-        for (let index = 0; index < a.length; index += 1) {
-            result |= a.charCodeAt(index) ^ b.charCodeAt(index);
-        }
-        return result === 0;
-    },
-    async verifyPassword(password, storedHash) {
-        const [saltHex, originalHashHex] = storedHash.split(':');
-        if (!saltHex || !originalHashHex || !/^[a-f0-9]+$/i.test(saltHex) || !/^[a-f0-9]+$/i.test(originalHashHex)) {
-            return false;
-        }
-        const saltPairs = saltHex.match(/.{1,2}/g);
-        if (!saltPairs)
-            return false;
-        const salt = new Uint8Array(saltPairs.map((pair) => parseInt(pair, 16)));
-        const baseKey = await crypto.subtle.importKey('raw', new TextEncoder().encode(password), 'PBKDF2', false, ['deriveBits']);
-        const bits = await crypto.subtle.deriveBits({
-            name: 'PBKDF2',
-            salt,
-            iterations: 100000,
-            hash: 'SHA-256',
-        }, baseKey, 256);
-        const candidateHashHex = Array.from(new Uint8Array(bits))
-            .map((byte) => byte.toString(16).padStart(2, '0'))
-            .join('');
-        return CryptoUtils.timingSafeEqual(candidateHashHex, originalHashHex);
-    },
-    async generateToken(payload, secret) {
-        const header = btoa(JSON.stringify({ alg: 'HS256', typ: 'JWT' }));
-        const encodedPayload = btoa(JSON.stringify({
-            ...payload,
-            exp: Math.floor(Date.now() / 1000) + SESSION_TTL_SECONDS,
-        }));
-        const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
-        const signature = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(`${header}.${encodedPayload}`));
-        const signatureHex = Array.from(new Uint8Array(signature))
-            .map((byte) => byte.toString(16).padStart(2, '0'))
-            .join('');
-        return `${header}.${encodedPayload}.${signatureHex}`;
-    },
-    async verifyToken(token, secret) {
-        try {
-            const [header, encodedPayload, signatureHex] = token.split('.');
-            if (!header || !encodedPayload || !signatureHex || !/^[a-f0-9]+$/i.test(signatureHex)) {
-                return null;
-            }
-            const signaturePairs = signatureHex.match(/.{1,2}/g);
-            if (!signaturePairs)
-                return null;
-            const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['verify']);
-            const verified = await crypto.subtle.verify('HMAC', key, new Uint8Array(signaturePairs.map((pair) => parseInt(pair, 16))), new TextEncoder().encode(`${header}.${encodedPayload}`));
-            if (!verified)
-                return null;
-            const payload = JSON.parse(atob(encodedPayload));
-            if (typeof payload.artistId !== 'string' ||
-                typeof payload.exp !== 'number' ||
-                Math.floor(Date.now() / 1000) > payload.exp) {
-                return null;
-            }
-            return { artistId: payload.artistId };
-        }
-        catch {
-            return null;
-        }
-    },
-};
-// ---------------------------------------------------------------------------
-// VALIDATION + SMALL HELPERS
-// ---------------------------------------------------------------------------
+const SHOP_FEE_TYPES = new Set(['percentage', 'fixed', 'booth-rent', 'hybrid', 'none']);
+const EXPENSE_FREQUENCIES = new Set(['weekly', 'monthly', 'one-time']);
 function isValidEmail(value) {
     return typeof value === 'string' && value.length <= 254 && EMAIL_RE.test(value);
 }
@@ -118,437 +13,324 @@ function isNonEmptyString(value, maxLength = 255) {
 function isValidPassword(value) {
     return typeof value === 'string' && value.length >= 8 && value.length <= 128;
 }
-function escapeHtml(value) {
-    return value.replace(/[&<>"']/g, (character) => {
-        const entities = {
-            '&': '&amp;',
-            '<': '&lt;',
-            '>': '&gt;',
-            '"': '&quot;',
-            "'": '&#039;',
-        };
-        return entities[character];
-    });
+function isValidIsoDate(value) {
+    return typeof value === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(value) && !Number.isNaN(Date.parse(`${value}T00:00:00`));
 }
-function getResetUrl(appUrl, token) {
-    const url = new URL('/reset-password', appUrl);
-    url.searchParams.set('token', token);
-    return url.toString();
+function cleanText(value, maxLength, fallback = '') {
+    return typeof value === 'string' ? value.trim().slice(0, maxLength) || fallback : fallback;
 }
-function jsonResponse(data, status = 200, extraHeaders = {}) {
+function json(data, status = 200, corsHeaders = {}) {
     return new Response(JSON.stringify(data), {
         status,
         headers: {
             'Content-Type': 'application/json; charset=utf-8',
-            ...extraHeaders,
+            ...corsHeaders,
         },
     });
 }
-function htmlEmailShell(title, bodyHtml) {
-    return `
-<!doctype html>
-<html lang="en">
-  <body style="margin:0;padding:0;background:#f4efe7;color:#16130f;font-family:Arial,Helvetica,sans-serif;">
-    <div style="max-width:600px;margin:0 auto;padding:32px 18px;">
-      <div style="background:#16130f;color:#efe7d8;padding:20px 24px;">
-        <div style="font-size:22px;font-weight:700;letter-spacing:.4px;">
-          inktrack<span style="color:#c39a48;">.</span>
-        </div>
-        <div style="font-size:11px;letter-spacing:2px;text-transform:uppercase;color:#c39a48;margin-top:4px;">
-          Artist Revenue Console
-        </div>
-      </div>
-      <div style="background:#ffffff;padding:30px 24px;border:1px solid #e4ddd1;">
-        <h1 style="margin:0 0 16px;font-size:26px;line-height:1.2;color:#16130f;">
-          ${title}
-        </h1>
-        ${bodyHtml}
-      </div>
-      <div style="padding:18px 10px;color:#786f65;font-size:12px;line-height:1.5;">
-        InkTrack helps artists keep a clear ledger of sessions, earnings, and shop splits.
-      </div>
-    </div>
-  </body>
-</html>`;
+function calculateNet(grossAmount, shopFeeType, shopCutPercentage, shopFixedFee) {
+    const percentageFee = shopFeeType === 'percentage' || shopFeeType === 'hybrid'
+        ? grossAmount * (shopCutPercentage / 100)
+        : 0;
+    const fixedFee = shopFeeType === 'fixed' || shopFeeType === 'hybrid'
+        ? shopFixedFee
+        : 0;
+    return Math.max(0, Math.round((grossAmount - percentageFee - fixedFee) * 100) / 100);
 }
-// ---------------------------------------------------------------------------
-// EMAIL DELIVERY THROUGH RESEND
-// ---------------------------------------------------------------------------
-async function sendEmail(env, email) {
-    if (!env.RESEND_API_KEY || !env.EMAIL_FROM || !env.APP_URL) {
-        throw new Error('Email configuration is incomplete.');
+async function readJson(request) {
+    try {
+        const parsed = await request.json();
+        return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+            ? parsed
+            : null;
     }
+    catch {
+        return null;
+    }
+}
+const CryptoUtils = {
+    uuid() {
+        return crypto.randomUUID();
+    },
+    randomHex(byteLength = 32) {
+        const bytes = crypto.getRandomValues(new Uint8Array(byteLength));
+        return Array.from(bytes).map((byte) => byte.toString(16).padStart(2, '0')).join('');
+    },
+    async hashPassword(password) {
+        const salt = crypto.getRandomValues(new Uint8Array(16));
+        const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(password), 'PBKDF2', false, ['deriveBits']);
+        const bits = await crypto.subtle.deriveBits({ name: 'PBKDF2', salt, iterations: 100000, hash: 'SHA-256' }, key, 256);
+        const saltHex = Array.from(salt).map((byte) => byte.toString(16).padStart(2, '0')).join('');
+        const hashHex = Array.from(new Uint8Array(bits)).map((byte) => byte.toString(16).padStart(2, '0')).join('');
+        return `${saltHex}:${hashHex}`;
+    },
+    timingSafeEqual(left, right) {
+        if (left.length !== right.length)
+            return false;
+        let result = 0;
+        for (let index = 0; index < left.length; index += 1) {
+            result |= left.charCodeAt(index) ^ right.charCodeAt(index);
+        }
+        return result === 0;
+    },
+    async verifyPassword(password, storedHash) {
+        const [saltHex, expectedHash] = storedHash.split(':');
+        if (!saltHex || !expectedHash || !/^[a-f0-9]+$/i.test(saltHex) || !/^[a-f0-9]+$/i.test(expectedHash))
+            return false;
+        const pairs = saltHex.match(/.{1,2}/g);
+        if (!pairs)
+            return false;
+        const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(password), 'PBKDF2', false, ['deriveBits']);
+        const bits = await crypto.subtle.deriveBits({
+            name: 'PBKDF2',
+            salt: new Uint8Array(pairs.map((pair) => parseInt(pair, 16))),
+            iterations: 100000,
+            hash: 'SHA-256',
+        }, key, 256);
+        const candidate = Array.from(new Uint8Array(bits)).map((byte) => byte.toString(16).padStart(2, '0')).join('');
+        return CryptoUtils.timingSafeEqual(candidate, expectedHash);
+    },
+    async signToken(artistId, secret) {
+        const header = btoa(JSON.stringify({ alg: 'HS256', typ: 'JWT' }));
+        const payload = btoa(JSON.stringify({ artistId, exp: Math.floor(Date.now() / 1000) + 86400 }));
+        const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+        const signature = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(`${header}.${payload}`));
+        const signatureHex = Array.from(new Uint8Array(signature)).map((byte) => byte.toString(16).padStart(2, '0')).join('');
+        return `${header}.${payload}.${signatureHex}`;
+    },
+    async verifyToken(token, secret) {
+        try {
+            const [header, payload, signatureHex] = token.split('.');
+            if (!header || !payload || !signatureHex || !/^[a-f0-9]+$/i.test(signatureHex))
+                return null;
+            const pairs = signatureHex.match(/.{1,2}/g);
+            if (!pairs)
+                return null;
+            const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['verify']);
+            const valid = await crypto.subtle.verify('HMAC', key, new Uint8Array(pairs.map((pair) => parseInt(pair, 16))), new TextEncoder().encode(`${header}.${payload}`));
+            if (!valid)
+                return null;
+            const decoded = JSON.parse(atob(payload));
+            if (typeof decoded.artistId !== 'string' || typeof decoded.exp !== 'number')
+                return null;
+            if (Date.now() / 1000 >= decoded.exp)
+                return null;
+            return { artistId: decoded.artistId };
+        }
+        catch {
+            return null;
+        }
+    },
+};
+function validateTransaction(value) {
+    if (!isNonEmptyString(value.id, 64))
+        return { ok: false, error: 'Missing or invalid session ID.' };
+    if (typeof value.timestamp !== 'string' || Number.isNaN(Date.parse(value.timestamp)))
+        return { ok: false, error: 'Invalid session timestamp.' };
+    if (typeof value.incomeType !== 'string' || !INCOME_TYPES.has(value.incomeType))
+        return { ok: false, error: 'Invalid category.' };
+    if (typeof value.paymentMethod !== 'string' || !PAYMENT_METHODS.has(value.paymentMethod))
+        return { ok: false, error: 'Invalid payment channel.' };
+    const grossAmount = Number(value.grossAmount);
+    if (!Number.isFinite(grossAmount) || grossAmount <= 0 || grossAmount > 1_000_000) {
+        return { ok: false, error: 'Gross amount must be a positive number.' };
+    }
+    // Legacy exports that existed before shop agreements use the original percentage split.
+    const requestedFeeType = value.shopFeeType ?? 'percentage';
+    if (typeof requestedFeeType !== 'string' || !SHOP_FEE_TYPES.has(requestedFeeType)) {
+        return { ok: false, error: 'Invalid shop agreement.' };
+    }
+    const shopFeeType = requestedFeeType;
+    const rawPercentage = Number(value.shopCutPercentage ?? 40);
+    const rawFixedFee = Number(value.shopFixedFee ?? 0);
+    if (!Number.isFinite(rawPercentage) || rawPercentage < 0 || rawPercentage > 100) {
+        return { ok: false, error: 'Shop split must be between 0% and 100%.' };
+    }
+    if (!Number.isFinite(rawFixedFee) || rawFixedFee < 0 || rawFixedFee > 1_000_000) {
+        return { ok: false, error: 'Fixed shop fee must be a valid non-negative amount.' };
+    }
+    const shopCutPercentage = shopFeeType === 'percentage' || shopFeeType === 'hybrid' ? Math.round(rawPercentage * 100) / 100 : 0;
+    const shopFixedFee = shopFeeType === 'fixed' || shopFeeType === 'hybrid' ? Math.round(rawFixedFee * 100) / 100 : 0;
+    if (shopFixedFee > grossAmount) {
+        return { ok: false, error: 'Fixed shop fee cannot be higher than the gross amount.' };
+    }
+    return {
+        ok: true,
+        data: {
+            id: value.id,
+            timestamp: value.timestamp,
+            clientName: cleanText(value.clientName, 255, 'Anonymous Client'),
+            description: cleanText(value.description, 1000) || null,
+            incomeType: value.incomeType,
+            paymentMethod: value.paymentMethod,
+            grossAmount: Math.round(grossAmount * 100) / 100,
+            shopFeeType,
+            shopCutPercentage,
+            shopFixedFee,
+        },
+    };
+}
+function validateExpense(value) {
+    if (!isNonEmptyString(value.name, 100))
+        return { ok: false, error: 'Cost name is required.' };
+    const amount = Number(value.amount);
+    if (!Number.isFinite(amount) || amount <= 0 || amount > 1_000_000) {
+        return { ok: false, error: 'Cost amount must be greater than zero.' };
+    }
+    if (typeof value.frequency !== 'string' || !EXPENSE_FREQUENCIES.has(value.frequency)) {
+        return { ok: false, error: 'Choose weekly, monthly, or one-time.' };
+    }
+    if (!isValidIsoDate(value.startsOn))
+        return { ok: false, error: 'Choose a valid start date.' };
+    const endsOn = value.endsOn === null || value.endsOn === undefined || value.endsOn === ''
+        ? null
+        : isValidIsoDate(value.endsOn)
+            ? value.endsOn
+            : 'INVALID';
+    if (endsOn === 'INVALID')
+        return { ok: false, error: 'End date is invalid.' };
+    if (endsOn && endsOn < value.startsOn)
+        return { ok: false, error: 'End date cannot be before start date.' };
+    return {
+        ok: true,
+        data: {
+            name: value.name.trim().slice(0, 100),
+            amount: Math.round(amount * 100) / 100,
+            frequency: value.frequency,
+            startsOn: value.startsOn,
+            endsOn,
+        },
+    };
+}
+async function sendEmail(env, to, subject, html) {
+    if (!env.RESEND_API_KEY || !env.EMAIL_FROM || !env.APP_URL)
+        throw new Error('Email configuration is incomplete.');
     const response = await fetch('https://api.resend.com/emails', {
         method: 'POST',
         headers: {
             Authorization: `Bearer ${env.RESEND_API_KEY}`,
             'Content-Type': 'application/json',
         },
-        body: JSON.stringify({
-            from: env.EMAIL_FROM,
-            to: [email.to],
-            subject: email.subject,
-            text: email.text,
-            html: email.html,
-        }),
+        body: JSON.stringify({ from: env.EMAIL_FROM, to: [to], subject, html }),
     });
     if (!response.ok) {
-        const resendError = await response.text();
-        console.error('Resend email delivery failed:', response.status, resendError);
-        throw new Error(`Resend rejected email request with status ${response.status}.`);
+        console.error('Resend failed:', response.status, await response.text());
+        throw new Error('Email delivery failed.');
     }
 }
-async function sendWelcomeEmail(env, email, artistName) {
-    const safeName = escapeHtml(artistName);
-    const dashboardUrl = new URL('/dashboard', env.APP_URL).toString();
-    await sendEmail(env, {
-        to: email,
-        subject: 'Welcome to InkTrack',
-        text: `Welcome to InkTrack, ${artistName}. Your ledger is ready. Open InkTrack: ${dashboardUrl}`,
-        html: htmlEmailShell(`Welcome to InkTrack, ${safeName}.`, `
-        <p style="font-size:16px;line-height:1.6;margin:0 0 16px;">
-          Your artist ledger is ready. You can now log sessions, track weekly income,
-          review shop splits, and see how your month is progressing.
-        </p>
-        <p style="margin:24px 0;">
-          <a href="${dashboardUrl}" style="display:inline-block;background:#a83a2c;color:#ffffff;text-decoration:none;padding:13px 18px;font-weight:700;border-radius:4px;">
-            Open InkTrack
-          </a>
-        </p>
-        <p style="font-size:12px;color:#786f65;line-height:1.5;margin:20px 0 0;">
-          If you did not create this account, you can safely ignore this email.
-        </p>`),
-    });
-}
-async function sendPasswordResetEmail(env, email, resetUrl) {
-    await sendEmail(env, {
-        to: email,
-        subject: 'Reset your InkTrack password',
-        text: `We received a request to reset your InkTrack password. Use this link within one hour: ${resetUrl}`,
-        html: htmlEmailShell('Reset your password', `
-        <p style="font-size:16px;line-height:1.6;margin:0 0 16px;">
-          We received a request to reset the password for your InkTrack account.
-        </p>
-        <p style="margin:24px 0;">
-          <a href="${resetUrl}" style="display:inline-block;background:#a83a2c;color:#ffffff;text-decoration:none;padding:13px 18px;font-weight:700;border-radius:4px;">
-            Reset Password
-          </a>
-        </p>
-        <p style="font-size:14px;line-height:1.6;margin:0;">
-          This reset link expires in <strong>1 hour</strong>.
-        </p>
-        <p style="font-size:12px;color:#786f65;line-height:1.5;margin:20px 0 0;">
-          If you did not request a password reset, you can safely ignore this email.
-        </p>`),
-    });
-}
-// ---------------------------------------------------------------------------
-// TRANSACTION VALIDATION
-// ---------------------------------------------------------------------------
-function validateTransactionPayload(data) {
-    if (!data || typeof data !== 'object') {
-        return { ok: false, error: 'Missing transaction body.' };
-    }
-    const transaction = data;
-    if (!isNonEmptyString(transaction.id, 64)) {
-        return { ok: false, error: 'Missing or invalid id.' };
-    }
-    if (typeof transaction.timestamp !== 'string' || Number.isNaN(Date.parse(transaction.timestamp))) {
-        return { ok: false, error: 'Missing or invalid timestamp.' };
-    }
-    if (transaction.clientName !== undefined &&
-        transaction.clientName !== null &&
-        typeof transaction.clientName !== 'string') {
-        return { ok: false, error: 'Invalid clientName.' };
-    }
-    if (transaction.description !== undefined &&
-        transaction.description !== null &&
-        typeof transaction.description !== 'string') {
-        return { ok: false, error: 'Invalid description.' };
-    }
-    if (typeof transaction.incomeType !== 'string' || !INCOME_TYPES.has(transaction.incomeType)) {
-        return { ok: false, error: 'Invalid incomeType.' };
-    }
-    if (typeof transaction.paymentMethod !== 'string' ||
-        !PAYMENT_METHODS.has(transaction.paymentMethod)) {
-        return { ok: false, error: 'Invalid paymentMethod.' };
-    }
-    const gross = Number(transaction.grossAmount);
-    if (!Number.isFinite(gross) || gross <= 0 || gross > 1_000_000) {
-        return { ok: false, error: 'grossAmount must be a positive number.' };
-    }
-    const cut = Number(transaction.shopCutPercentage);
-    if (!Number.isFinite(cut) || cut < 0 || cut > 100) {
-        return { ok: false, error: 'shopCutPercentage must be between 0 and 100.' };
-    }
-    return {
-        ok: true,
-        value: {
-            id: transaction.id,
-            timestamp: transaction.timestamp,
-            clientName: typeof transaction.clientName === 'string' && transaction.clientName.trim()
-                ? transaction.clientName.trim().slice(0, 255)
-                : 'Anonymous Client',
-            description: typeof transaction.description === 'string' && transaction.description.trim()
-                ? transaction.description.trim().slice(0, 1000)
-                : null,
-            incomeType: transaction.incomeType,
-            paymentMethod: transaction.paymentMethod,
-            grossAmount: Math.round(gross * 100) / 100,
-            shopCutPercentage: Math.round(cut * 100) / 100,
-        },
-    };
-}
-async function parseJsonBody(request) {
-    try {
-        const body = await request.json();
-        if (!body || typeof body !== 'object' || Array.isArray(body)) {
-            return null;
-        }
-        return body;
-    }
-    catch {
-        return null;
-    }
-}
-// ---------------------------------------------------------------------------
-// WORKER
-// ---------------------------------------------------------------------------
 export default {
     async fetch(request, env, _ctx) {
         const url = new URL(request.url);
-        const corsHeaders = {
+        const cors = {
             'Access-Control-Allow-Origin': '*',
             'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
             'Access-Control-Allow-Headers': 'Content-Type, Authorization',
         };
-        if (request.method === 'OPTIONS') {
-            return new Response(null, { headers: corsHeaders });
-        }
-        const respond = (data, status = 200) => jsonResponse(data, status, corsHeaders);
-        if (!env.JWT_SECRET) {
-            console.error('JWT_SECRET is missing.');
+        const respond = (data, status = 200) => json(data, status, cors);
+        if (request.method === 'OPTIONS')
+            return new Response(null, { headers: cors });
+        if (!env.JWT_SECRET)
             return respond({ error: 'Server misconfigured.' }, 500);
-        }
         try {
-            // ---------------------------------------------------------------------
-            // AUTH ROUTES
-            // ---------------------------------------------------------------------
-            if (url.pathname.startsWith('/api/auth/')) {
-                // POST /api/auth/signup
-                if (request.method === 'POST' && url.pathname === '/api/auth/signup') {
-                    const body = await parseJsonBody(request);
-                    if (!body)
-                        return respond({ error: 'Invalid request body.' }, 400);
-                    const { email, password, artistName } = body;
-                    if (!isValidEmail(email)) {
-                        return respond({ error: 'A valid email is required.' }, 400);
-                    }
-                    if (!isValidPassword(password)) {
-                        return respond({ error: 'Password must be 8-128 characters.' }, 400);
-                    }
-                    if (!isNonEmptyString(artistName, 255)) {
-                        return respond({ error: 'Artist name is required.' }, 400);
-                    }
-                    const normalizedEmail = email.toLowerCase().trim();
-                    const cleanArtistName = artistName.trim();
-                    const existing = await env.DB
-                        .prepare('SELECT id FROM artists WHERE email = ?')
-                        .bind(normalizedEmail)
-                        .first();
-                    if (existing) {
-                        return respond({ error: 'An account with that email already exists.' }, 409);
-                    }
-                    const artistId = CryptoUtils.uuidv4();
-                    const passwordHash = await CryptoUtils.hashPassword(password);
-                    await env.DB
-                        .prepare('INSERT INTO artists (id, email, password_hash, artist_name) VALUES (?, ?, ?, ?)')
-                        .bind(artistId, normalizedEmail, passwordHash, cleanArtistName)
-                        .run();
-                    // A welcome email should not prevent account creation if delivery is
-                    // temporarily unavailable. Delivery errors are visible in Worker logs.
-                    try {
-                        await sendWelcomeEmail(env, normalizedEmail, cleanArtistName);
-                    }
-                    catch (emailError) {
-                        console.error('Welcome email could not be sent:', emailError);
-                    }
-                    return respond({ success: true }, 201);
+            // -------------------- PUBLIC AUTH ROUTES --------------------
+            if (url.pathname === '/api/auth/signup' && request.method === 'POST') {
+                const body = await readJson(request);
+                if (!body)
+                    return respond({ error: 'Invalid request body.' }, 400);
+                const email = body.email;
+                const password = body.password;
+                const artistName = body.artistName;
+                if (!isValidEmail(email))
+                    return respond({ error: 'A valid email is required.' }, 400);
+                if (!isValidPassword(password))
+                    return respond({ error: 'Password must be 8-128 characters.' }, 400);
+                if (!isNonEmptyString(artistName, 255))
+                    return respond({ error: 'Artist name is required.' }, 400);
+                const normalizedEmail = email.toLowerCase().trim();
+                const existing = await env.DB.prepare('SELECT id FROM artists WHERE email = ?').bind(normalizedEmail).first();
+                if (existing)
+                    return respond({ error: 'An account with that email already exists.' }, 409);
+                const artistId = CryptoUtils.uuid();
+                await env.DB
+                    .prepare('INSERT INTO artists (id, email, password_hash, artist_name) VALUES (?, ?, ?, ?)')
+                    .bind(artistId, normalizedEmail, await CryptoUtils.hashPassword(password), artistName.trim())
+                    .run();
+                try {
+                    await sendEmail(env, normalizedEmail, 'Welcome to InkTrack', `<div style="font-family:Arial,sans-serif"><h1>Welcome to InkTrack, ${artistName.trim()}.</h1><p>Your artist ledger is ready.</p><p><a href="${new URL('/login', env.APP_URL)}">Open InkTrack</a></p></div>`);
                 }
-                // POST /api/auth/login
-                if (request.method === 'POST' && url.pathname === '/api/auth/login') {
-                    const body = await parseJsonBody(request);
-                    if (!body)
-                        return respond({ error: 'Invalid request body.' }, 400);
-                    const { email, password } = body;
-                    if (!isValidEmail(email) || typeof password !== 'string' || !password) {
-                        return respond({ error: 'Invalid email or password.' }, 401);
-                    }
-                    const artist = await env.DB
-                        .prepare('SELECT id, password_hash FROM artists WHERE email = ?')
-                        .bind(email.toLowerCase().trim())
-                        .first();
-                    if (!artist ||
-                        typeof artist.id !== 'string' ||
-                        typeof artist.password_hash !== 'string' ||
-                        !(await CryptoUtils.verifyPassword(password, artist.password_hash))) {
-                        return respond({ error: 'Invalid email or password.' }, 401);
-                    }
-                    const token = await CryptoUtils.generateToken({ artistId: artist.id }, env.JWT_SECRET);
-                    return respond({ token });
+                catch (error) {
+                    console.error('Welcome email error:', error);
                 }
-                // POST /api/auth/forgot
-                if (request.method === 'POST' && url.pathname === '/api/auth/forgot') {
-                    const body = await parseJsonBody(request);
-                    if (!body)
-                        return respond({ error: 'Invalid request body.' }, 400);
-                    const { email } = body;
-                    // Always return the same response. This prevents account enumeration.
-                    if (isValidEmail(email)) {
-                        const normalizedEmail = email.toLowerCase().trim();
-                        const artist = await env.DB
-                            .prepare('SELECT id FROM artists WHERE email = ?')
-                            .bind(normalizedEmail)
-                            .first();
-                        if (artist && typeof artist.id === 'string') {
-                            const token = CryptoUtils.generateResetToken();
-                            const expiresAt = new Date(Date.now() + RESET_TOKEN_TTL_MS).toISOString();
-                            const resetUrl = getResetUrl(env.APP_URL, token);
-                            // A user only needs one active reset link. Old unused links for
-                            // the same artist become invalid when a new reset is requested.
-                            await env.DB.batch([
-                                env.DB
-                                    .prepare('DELETE FROM password_resets WHERE artist_id = ? AND used = 0')
-                                    .bind(artist.id),
-                                env.DB
-                                    .prepare('INSERT INTO password_resets (id, artist_id, token, expires_at, used) VALUES (?, ?, ?, ?, 0)')
-                                    .bind(CryptoUtils.uuidv4(), artist.id, token, expiresAt),
-                            ]);
-                            try {
-                                await sendPasswordResetEmail(env, normalizedEmail, resetUrl);
-                            }
-                            catch (emailError) {
-                                // Never expose email delivery details to the requesting user.
-                                // Check Worker logs + Resend Logs to diagnose delivery issues.
-                                console.error('Password reset email could not be sent:', emailError);
-                            }
+                return respond({ success: true }, 201);
+            }
+            if (url.pathname === '/api/auth/login' && request.method === 'POST') {
+                const body = await readJson(request);
+                if (!body || !isValidEmail(body.email) || typeof body.password !== 'string') {
+                    return respond({ error: 'Invalid email or password.' }, 401);
+                }
+                const artist = await env.DB
+                    .prepare('SELECT id, password_hash FROM artists WHERE email = ?')
+                    .bind(body.email.toLowerCase().trim())
+                    .first();
+                if (!artist || !(await CryptoUtils.verifyPassword(body.password, artist.password_hash))) {
+                    return respond({ error: 'Invalid email or password.' }, 401);
+                }
+                return respond({ token: await CryptoUtils.signToken(artist.id, env.JWT_SECRET) });
+            }
+            if (url.pathname === '/api/auth/forgot' && request.method === 'POST') {
+                const body = await readJson(request);
+                if (!body)
+                    return respond({ error: 'Invalid request body.' }, 400);
+                if (isValidEmail(body.email)) {
+                    const email = body.email.toLowerCase().trim();
+                    const artist = await env.DB.prepare('SELECT id FROM artists WHERE email = ?').bind(email).first();
+                    if (artist) {
+                        const token = CryptoUtils.randomHex();
+                        const expiresAt = new Date(Date.now() + 60 * 60 * 1000).toISOString();
+                        const resetUrl = new URL('/reset-password', env.APP_URL);
+                        resetUrl.searchParams.set('token', token);
+                        await env.DB.batch([
+                            env.DB.prepare('DELETE FROM password_resets WHERE artist_id = ? AND used = 0').bind(artist.id),
+                            env.DB
+                                .prepare('INSERT INTO password_resets (id, artist_id, token, expires_at, used) VALUES (?, ?, ?, ?, 0)')
+                                .bind(CryptoUtils.uuid(), artist.id, token, expiresAt),
+                        ]);
+                        try {
+                            await sendEmail(env, email, 'Reset your InkTrack password', `<div style="font-family:Arial,sans-serif"><h1>Reset your password</h1><p><a href="${resetUrl.toString()}">Reset Password</a></p><p>This link expires in one hour.</p></div>`);
+                        }
+                        catch (error) {
+                            console.error('Reset email error:', error);
                         }
                     }
-                    return respond({
-                        message: 'If that email has an account, a reset link is on its way.',
-                    });
                 }
-                // POST /api/auth/reset
-                if (request.method === 'POST' && url.pathname === '/api/auth/reset') {
-                    const body = await parseJsonBody(request);
-                    if (!body)
-                        return respond({ error: 'Invalid request body.' }, 400);
-                    const { token, newPassword } = body;
-                    if (!isNonEmptyString(token, 128) || !isValidPassword(newPassword)) {
-                        return respond({ error: 'Invalid or expired reset link.' }, 400);
-                    }
-                    const resetRecord = await env.DB
-                        .prepare('SELECT artist_id, expires_at, used FROM password_resets WHERE token = ?')
-                        .bind(token)
-                        .first();
-                    const alreadyUsed = resetRecord?.used === 1 || resetRecord?.used === true;
-                    const expired = !resetRecord ||
-                        typeof resetRecord.expires_at !== 'string' ||
-                        Number.isNaN(Date.parse(resetRecord.expires_at)) ||
-                        Date.now() > new Date(resetRecord.expires_at).getTime();
-                    if (!resetRecord || alreadyUsed || expired || typeof resetRecord.artist_id !== 'string') {
-                        return respond({ error: 'Invalid or expired reset link.' }, 400);
-                    }
-                    const updatedHash = await CryptoUtils.hashPassword(newPassword);
-                    await env.DB.batch([
-                        env.DB
-                            .prepare('UPDATE artists SET password_hash = ? WHERE id = ?')
-                            .bind(updatedHash, resetRecord.artist_id),
-                        env.DB
-                            .prepare('UPDATE password_resets SET used = 1 WHERE token = ?')
-                            .bind(token),
-                    ]);
-                    return respond({
-                        success: true,
-                        message: 'Password updated. You can now sign in.',
-                    });
-                }
-                return respond({ error: 'Not found.' }, 404);
+                return respond({ message: 'If that email has an account, a reset link is on its way.' });
             }
-            // ---------------------------------------------------------------------
-            // PROTECTED LEDGER ROUTES
-            // ---------------------------------------------------------------------
+            if (url.pathname === '/api/auth/reset' && request.method === 'POST') {
+                const body = await readJson(request);
+                if (!body || !isNonEmptyString(body.token, 128) || !isValidPassword(body.newPassword)) {
+                    return respond({ error: 'Invalid or expired reset link.' }, 400);
+                }
+                const reset = await env.DB
+                    .prepare('SELECT artist_id, expires_at, used FROM password_resets WHERE token = ?')
+                    .bind(body.token)
+                    .first();
+                if (!reset || reset.used === 1 || Date.now() > new Date(reset.expires_at).getTime()) {
+                    return respond({ error: 'Invalid or expired reset link.' }, 400);
+                }
+                await env.DB.batch([
+                    env.DB.prepare('UPDATE artists SET password_hash = ? WHERE id = ?').bind(await CryptoUtils.hashPassword(body.newPassword), reset.artist_id),
+                    env.DB.prepare('UPDATE password_resets SET used = 1 WHERE token = ?').bind(body.token),
+                ]);
+                return respond({ success: true, message: 'Password updated. You can now sign in.' });
+            }
+            // -------------------- AUTHENTICATED ROUTES --------------------
             const authHeader = request.headers.get('Authorization');
-            if (!authHeader?.startsWith('Bearer ')) {
+            if (!authHeader?.startsWith('Bearer '))
                 return respond({ error: 'Access denied.' }, 401);
-            }
-            const session = await CryptoUtils.verifyToken(authHeader.slice('Bearer '.length), env.JWT_SECRET);
-            if (!session) {
+            const session = await CryptoUtils.verifyToken(authHeader.slice(7), env.JWT_SECRET);
+            if (!session)
                 return respond({ error: 'Invalid or expired session.' }, 401);
-            }
-            // POST /api/transactions/import
-            if (url.pathname === '/api/transactions/import' && request.method === 'POST') {
-                const body = await parseJsonBody(request);
-                if (!body || !Array.isArray(body.transactions)) {
-                    return respond({ error: 'Expected a transactions array.' }, 400);
-                }
-                if (body.transactions.length === 0) {
-                    return respond({ error: 'The backup file contains no sessions.' }, 400);
-                }
-                if (body.transactions.length > 1000) {
-                    return respond({ error: 'A backup can contain at most 1,000 sessions.' }, 400);
-                }
-                const restoredTransactions = [];
-                for (const rawTransaction of body.transactions) {
-                    const validated = validateTransactionPayload(rawTransaction);
-                    if (!validated.ok) {
-                        return respond({
-                            error: `Backup contains an invalid session: ${validated.error}`,
-                        }, 400);
-                    }
-                    restoredTransactions.push(validated.value);
-                }
-                const statements = restoredTransactions.map((transaction) => {
-                    const netAmount = Math.round(transaction.grossAmount *
-                        (1 - transaction.shopCutPercentage / 100) *
-                        100) / 100;
-                    return env.DB
-                        .prepare(`INSERT INTO transactions
-                (
-                  id,
-                  artist_id,
-                  timestamp,
-                  clientName,
-                  description,
-                  incomeType,
-                  paymentMethod,
-                  grossAmount,
-                  shopCutPercentage,
-                  netAmount
-                )
-              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-
-              ON CONFLICT(id) DO UPDATE SET
-                timestamp = excluded.timestamp,
-                clientName = excluded.clientName,
-                description = excluded.description,
-                incomeType = excluded.incomeType,
-                paymentMethod = excluded.paymentMethod,
-                grossAmount = excluded.grossAmount,
-                shopCutPercentage = excluded.shopCutPercentage,
-                netAmount = excluded.netAmount
-
-              WHERE transactions.artist_id = excluded.artist_id`)
-                        .bind(transaction.id, session.artistId, transaction.timestamp, transaction.clientName, transaction.description, transaction.incomeType, transaction.paymentMethod, transaction.grossAmount, transaction.shopCutPercentage, netAmount);
-                });
-                await env.DB.batch(statements);
-                return respond({
-                    success: true,
-                    restored: restoredTransactions.length,
-                    message: `Restored ${restoredTransactions.length} session(s) to your ledger.`,
-                });
-            }
-            // GET /api/transactions
+            // ---- Transactions ----
             if (url.pathname === '/api/transactions' && request.method === 'GET') {
                 const { results } = await env.DB
                     .prepare('SELECT * FROM transactions WHERE artist_id = ? ORDER BY timestamp DESC LIMIT 1000')
@@ -556,71 +338,148 @@ export default {
                     .all();
                 return respond(results);
             }
-            // POST /api/transactions
             if (url.pathname === '/api/transactions' && request.method === 'POST') {
-                const body = await parseJsonBody(request);
+                const body = await readJson(request);
                 if (!body)
                     return respond({ error: 'Invalid request body.' }, 400);
-                const validated = validateTransactionPayload(body);
-                if (!validated.ok) {
+                const validated = validateTransaction(body);
+                if (!validated.ok)
                     return respond({ error: validated.error }, 400);
-                }
-                const transaction = validated.value;
-                const netAmount = Math.round(transaction.grossAmount * (1 - transaction.shopCutPercentage / 100) * 100) / 100;
+                const tx = validated.data;
+                const netAmount = calculateNet(tx.grossAmount, tx.shopFeeType, tx.shopCutPercentage, tx.shopFixedFee);
                 await env.DB
                     .prepare(`INSERT INTO transactions
-             (id, artist_id, timestamp, clientName, description, incomeType, paymentMethod, grossAmount, shopCutPercentage, netAmount)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-                    .bind(transaction.id, session.artistId, transaction.timestamp, transaction.clientName, transaction.description, transaction.incomeType, transaction.paymentMethod, transaction.grossAmount, transaction.shopCutPercentage, netAmount)
+              (id, artist_id, timestamp, clientName, description, incomeType, paymentMethod, grossAmount, shopFeeType, shopCutPercentage, shopFixedFee, netAmount)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+                    .bind(tx.id, session.artistId, tx.timestamp, tx.clientName, tx.description, tx.incomeType, tx.paymentMethod, tx.grossAmount, tx.shopFeeType, tx.shopCutPercentage, tx.shopFixedFee, netAmount)
                     .run();
-                return respond({ success: true, id: transaction.id, netAmount }, 201);
+                return respond({ success: true, id: tx.id, netAmount }, 201);
             }
-            // PUT /api/transactions/:id
-            // The artist ID is included in every write condition so an authenticated
-            // artist can only modify their own ledger entries.
-            const transactionRoute = url.pathname.match(/^\/api\/transactions\/([^/]+)$/);
-            if (transactionRoute && request.method === 'PUT') {
-                const transactionId = decodeURIComponent(transactionRoute[1]);
-                const body = await parseJsonBody(request);
+            if (url.pathname === '/api/transactions/import' && request.method === 'POST') {
+                const body = await readJson(request);
+                const list = body?.transactions;
+                if (!Array.isArray(list) || list.length === 0 || list.length > 1000) {
+                    return respond({ error: 'Backup must contain 1 to 1,000 sessions.' }, 400);
+                }
+                const statements = [];
+                for (const item of list) {
+                    if (!item || typeof item !== 'object' || Array.isArray(item))
+                        return respond({ error: 'Backup contains an invalid session.' }, 400);
+                    const validated = validateTransaction(item);
+                    if (!validated.ok)
+                        return respond({ error: `Backup contains an invalid session: ${validated.error}` }, 400);
+                    const tx = validated.data;
+                    const netAmount = calculateNet(tx.grossAmount, tx.shopFeeType, tx.shopCutPercentage, tx.shopFixedFee);
+                    statements.push(env.DB.prepare(`INSERT INTO transactions
+                (id, artist_id, timestamp, clientName, description, incomeType, paymentMethod, grossAmount, shopFeeType, shopCutPercentage, shopFixedFee, netAmount)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(id) DO UPDATE SET
+                 timestamp = excluded.timestamp,
+                 clientName = excluded.clientName,
+                 description = excluded.description,
+                 incomeType = excluded.incomeType,
+                 paymentMethod = excluded.paymentMethod,
+                 grossAmount = excluded.grossAmount,
+                 shopFeeType = excluded.shopFeeType,
+                 shopCutPercentage = excluded.shopCutPercentage,
+                 shopFixedFee = excluded.shopFixedFee,
+                 netAmount = excluded.netAmount
+               WHERE transactions.artist_id = excluded.artist_id`).bind(tx.id, session.artistId, tx.timestamp, tx.clientName, tx.description, tx.incomeType, tx.paymentMethod, tx.grossAmount, tx.shopFeeType, tx.shopCutPercentage, tx.shopFixedFee, netAmount));
+                }
+                await env.DB.batch(statements);
+                return respond({ success: true, restored: statements.length, message: `Restored ${statements.length} session(s).` });
+            }
+            const transactionMatch = url.pathname.match(/^\/api\/transactions\/([^/]+)$/);
+            if (transactionMatch && request.method === 'PUT') {
+                const id = decodeURIComponent(transactionMatch[1]);
+                const body = await readJson(request);
                 if (!body)
                     return respond({ error: 'Invalid request body.' }, 400);
-                const validated = validateTransactionPayload(body);
-                if (!validated.ok) {
+                body.id = id;
+                const validated = validateTransaction(body);
+                if (!validated.ok)
                     return respond({ error: validated.error }, 400);
-                }
-                const transaction = validated.value;
-                if (transaction.id !== transactionId) {
-                    return respond({ error: 'Transaction ID does not match the requested record.' }, 400);
-                }
-                const netAmount = Math.round(transaction.grossAmount * (1 - transaction.shopCutPercentage / 100) * 100) / 100;
+                const tx = validated.data;
+                const netAmount = calculateNet(tx.grossAmount, tx.shopFeeType, tx.shopCutPercentage, tx.shopFixedFee);
                 const result = await env.DB
-                    .prepare(`UPDATE transactions
-             SET clientName = ?,
-                 description = ?,
-                 incomeType = ?,
-                 paymentMethod = ?,
-                 grossAmount = ?,
-                 shopCutPercentage = ?,
-                 netAmount = ?
+                    .prepare(`UPDATE transactions SET
+              clientName = ?, description = ?, incomeType = ?, paymentMethod = ?,
+              grossAmount = ?, shopFeeType = ?, shopCutPercentage = ?, shopFixedFee = ?, netAmount = ?
              WHERE id = ? AND artist_id = ?`)
-                    .bind(transaction.clientName, transaction.description, transaction.incomeType, transaction.paymentMethod, transaction.grossAmount, transaction.shopCutPercentage, netAmount, transactionId, session.artistId)
+                    .bind(tx.clientName, tx.description, tx.incomeType, tx.paymentMethod, tx.grossAmount, tx.shopFeeType, tx.shopCutPercentage, tx.shopFixedFee, netAmount, id, session.artistId)
                     .run();
-                if (!result.meta.changes) {
+                if (!result.meta.changes)
                     return respond({ error: 'Session not found.' }, 404);
-                }
-                return respond({ success: true, id: transactionId, netAmount });
+                return respond({ success: true, id, netAmount });
             }
-            // DELETE /api/transactions/:id
-            if (transactionRoute && request.method === 'DELETE') {
-                const transactionId = decodeURIComponent(transactionRoute[1]);
+            if (transactionMatch && request.method === 'DELETE') {
+                const id = decodeURIComponent(transactionMatch[1]);
                 const result = await env.DB
                     .prepare('DELETE FROM transactions WHERE id = ? AND artist_id = ?')
-                    .bind(transactionId, session.artistId)
+                    .bind(id, session.artistId)
                     .run();
-                if (!result.meta.changes) {
+                if (!result.meta.changes)
                     return respond({ error: 'Session not found.' }, 404);
-                }
-                return respond({ success: true, id: transactionId });
+                return respond({ success: true });
+            }
+            // ---- Recurring / one-time shop costs ----
+            if (url.pathname === '/api/shop-expenses' && request.method === 'GET') {
+                const { results } = await env.DB
+                    .prepare(`SELECT
+              id, name, amount, frequency,
+              starts_on AS startsOn,
+              ends_on AS endsOn,
+              created_at AS createdAt
+             FROM shop_expenses
+             WHERE artist_id = ?
+             ORDER BY starts_on DESC, created_at DESC`)
+                    .bind(session.artistId)
+                    .all();
+                return respond(results);
+            }
+            if (url.pathname === '/api/shop-expenses' && request.method === 'POST') {
+                const body = await readJson(request);
+                if (!body)
+                    return respond({ error: 'Invalid request body.' }, 400);
+                const validated = validateExpense(body);
+                if (!validated.ok)
+                    return respond({ error: validated.error }, 400);
+                const expense = validated.data;
+                const id = CryptoUtils.uuid();
+                await env.DB
+                    .prepare('INSERT INTO shop_expenses (id, artist_id, name, amount, frequency, starts_on, ends_on) VALUES (?, ?, ?, ?, ?, ?, ?)')
+                    .bind(id, session.artistId, expense.name, expense.amount, expense.frequency, expense.startsOn, expense.endsOn)
+                    .run();
+                return respond({ success: true, id }, 201);
+            }
+            const expenseMatch = url.pathname.match(/^\/api\/shop-expenses\/([^/]+)$/);
+            if (expenseMatch && request.method === 'PUT') {
+                const id = decodeURIComponent(expenseMatch[1]);
+                const body = await readJson(request);
+                if (!body)
+                    return respond({ error: 'Invalid request body.' }, 400);
+                const validated = validateExpense(body);
+                if (!validated.ok)
+                    return respond({ error: validated.error }, 400);
+                const expense = validated.data;
+                const result = await env.DB
+                    .prepare(`UPDATE shop_expenses SET name = ?, amount = ?, frequency = ?, starts_on = ?, ends_on = ?
+             WHERE id = ? AND artist_id = ?`)
+                    .bind(expense.name, expense.amount, expense.frequency, expense.startsOn, expense.endsOn, id, session.artistId)
+                    .run();
+                if (!result.meta.changes)
+                    return respond({ error: 'Shop cost not found.' }, 404);
+                return respond({ success: true, id });
+            }
+            if (expenseMatch && request.method === 'DELETE') {
+                const id = decodeURIComponent(expenseMatch[1]);
+                const result = await env.DB
+                    .prepare('DELETE FROM shop_expenses WHERE id = ? AND artist_id = ?')
+                    .bind(id, session.artistId)
+                    .run();
+                if (!result.meta.changes)
+                    return respond({ error: 'Shop cost not found.' }, 404);
+                return respond({ success: true });
             }
             return respond({ error: 'Not found.' }, 404);
         }
